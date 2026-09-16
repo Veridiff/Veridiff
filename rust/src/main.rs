@@ -16,7 +16,7 @@
 //! just wiring. See `src/lib.rs` for the actual engine.
 
 use frida::{DeviceManager, Frida, ScriptOption, SpawnOptions};
-use veridiff::{Arg, VeridiffEngine};
+use veridiff::{Arg, TraceCallOptions, VeridiffEngine};
 
 fn main() {
     let cli_args: Vec<String> = std::env::args().collect();
@@ -65,13 +65,19 @@ fn main() {
     // state that's normally set up by constructors/main() that haven't run
     // yet; if yours does, call engine.resume-equivalent (device.resume) and
     // arrange your own synchronization before tracing.
+    //
+    // warm_up: true so this demo doesn't itself fall into the PLT/GOT
+    // lazy-binding confound documented on TraceCallOptions -- without it,
+    // run A's first call into any externally-linked function (strcmp,
+    // here) would show a spurious divergence against run B that has
+    // nothing to do with arg_a vs arg_b.
+    let options = TraceCallOptions { warm_up: true };
     let trace_a = engine
-        .trace_call(&mut script, target_address, &[Arg::Str(arg_a.clone())], "int", None)
+        .trace_call(&mut script, target_address, &[Arg::Str(arg_a.clone())], "int", None, options)
         .expect("trace A failed");
     let trace_b = engine
-        .trace_call(&mut script, target_address, &[Arg::Str(arg_b.clone())], "int", None)
+        .trace_call(&mut script, target_address, &[Arg::Str(arg_b.clone())], "int", None, options)
         .expect("trace B failed");
-    let _ = device.resume(pid);
 
     println!(
         "trace A ({arg_a:?}): {} blocks, returned {:?}",
@@ -95,11 +101,21 @@ fn main() {
             println!("  run B took block  : {}", fmt(d.block_b));
 
             if let Some(last_common) = d.last_common_block {
+                // Disassembling only reads static code bytes at an address,
+                // so it needs the target mapped, not running -- this has to
+                // happen before device.resume() below, not after. Any RPC
+                // into the agent after resume() races the target actually
+                // exiting, and frida-rust's Exports::call has no timeout or
+                // dead-session detection on that blocking wait: losing that
+                // race hangs this process forever instead of erroring (see
+                // README field notes -- frida-python detects it and raises
+                // cleanly instead, so this is Rust-specific).
                 println!("\n  disassembly of the deciding block:");
                 match engine.disassemble_block(&mut script, &trace_a, last_common) {
                     Ok(instructions) => {
                         for insn in instructions {
-                            println!("    {:#x}  {} {}", insn.address, insn.mnemonic, insn.op_str);
+                            let marker = if insn.is_conditional_branch() { "  <-- decides here" } else { "" };
+                            println!("    {:#x}  {} {}{marker}", insn.address, insn.mnemonic, insn.op_str);
                         }
                     }
                     Err(e) => eprintln!("  (failed to disassemble: {e})"),
@@ -107,4 +123,8 @@ fn main() {
             }
         }
     }
+
+    // Purely a courtesy: lets the spawned process actually run and exit
+    // instead of being left stopped. Nothing above depends on this.
+    let _ = device.resume(pid);
 }

@@ -32,6 +32,8 @@ import sys
 from dataclasses import dataclass
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple, Union
 
+__version__ = "0.2.0"
+
 try:
     import frida  # type: ignore
 except ImportError:  # frida is only needed for live tracing, not for the
@@ -74,7 +76,7 @@ function nativeArgType(spec) {
 }
 
 rpc.exports = {
-    traceCall(targetHex, args, retType, moduleName) {
+    traceCall(targetHex, args, retType, moduleName, warmUp) {
         const target = ptr(targetHex);
         const mod = moduleName
             ? Process.getModuleByName(moduleName)
@@ -93,6 +95,23 @@ rpc.exports = {
 
         const fn = new NativeFunction(target, retType, args.map(nativeArgType));
         const nativeArgs = args.map(allocArg);
+
+        // Optional pre-execution pass: calls the target once, untraced,
+        // before the real (traced) call below. Exists because of a real,
+        // reproducible confound: a target's first-ever call to an
+        // externally-linked function (strcmp@plt, anything else routed
+        // through the PLT/GOT) takes the dynamic linker's lazy-binding
+        // resolver path, while every later call to that same external
+        // function skips straight to the now-resolved GOT entry -- a
+        // one-time difference in block-level control flow that has nothing
+        // to do with your arguments. Warming up with a fresh, untraced call
+        // using these SAME arguments resolves whatever GOT entries this
+        // exact code path touches before the traced call below runs, so the
+        // trace actually recorded isn't the one paying the resolver tax.
+        if (warmUp) {
+            fn(...nativeArgs);
+        }
+
         const tid = Process.getCurrentThreadId();
 
         let blockCount = 0;
@@ -223,6 +242,44 @@ class Arg:
         return {"type": self.kind, "value": value}
 
 
+# ARM64 mnemonics that are conditional branches despite having no dot-suffix
+# of their own -- see `_is_conditional_branch`.
+_ARM64_CONDITIONAL_MNEMONICS = frozenset({"cbz", "cbnz", "tbz", "tbnz"})
+
+
+def _is_conditional_branch(mnemonic: str) -> bool:
+    """Whether `mnemonic` is a conditional branch, across x86 and ARM64.
+
+    Disassembly itself needs no architecture-specific code -- Instruction.parse
+    (Capstone, via frida-gum) already decodes every architecture Frida
+    attaches to. This classification does, because Capstone's own
+    `Instruction.groups` doesn't distinguish conditional from unconditional
+    branches: verified live against a real x86 target, a `jne` and the
+    `jmp` two instructions later in the same basic block both report
+    `groups: ["branch_relative", "jump"]`, with nothing to tell them apart.
+    Mnemonic text is the only signal that does, on any architecture, so
+    that's what this checks instead of trusting `.groups`.
+
+    x86: any `jCC` mnemonic (`jz`, `jne`, `jle`, ...) except the
+    unconditional `jmp`.
+
+    ARM64: `b.cond` forms (`b.eq`, `b.ne`, `b.lt`, ...; Capstone renders the
+    condition as a dot-suffix) plus the compare/test-and-branch forms
+    (`cbz`, `cbnz`, `tbz`, `tbnz`), inherently conditional despite having no
+    dot-suffix of their own. Plain `b`/`bl`/`br`/`blx` are unconditional and
+    correctly fall through to False.
+
+    Unrecognized mnemonics (ARM32/Thumb, MIPS, anything else Capstone
+    supports that this hasn't been taught) return False rather than
+    guessing -- an unmarked instruction is a safe default; a wrongly marked
+    one isn't.
+    """
+    m = mnemonic.lower()
+    if m.startswith("j") and m != "jmp":
+        return True
+    return m.startswith("b.") or m in _ARM64_CONDITIONAL_MNEMONICS
+
+
 @dataclass(frozen=True)
 class Instruction:
     address: int
@@ -230,6 +287,11 @@ class Instruction:
     op_str: str
     size: int
     raw_bytes: bytes
+
+    @property
+    def is_conditional_branch(self) -> bool:
+        """Whether this instruction is a conditional branch -- see `_is_conditional_branch`."""
+        return _is_conditional_branch(self.mnemonic)
 
 
 @dataclass
@@ -377,12 +439,22 @@ class VeridiffEngine:
         args: Sequence[Arg],
         ret_type: str = "void",
         module: Optional[str] = None,
+        warm_up: bool = False,
     ) -> Trace:
         """Call `address` once with `args` and return its execution trace.
 
         `ret_type` and each Arg.kind are Frida NativeFunction type strings
         ('void', 'int', 'uint', 'int64', 'uint64', 'pointer'), plus the
         engine's own 'string' kind for a `const char *` argument.
+
+        `warm_up`, when true, has the agent call the target once, untraced,
+        with these same arguments immediately before the traced call --
+        see the comment on this in `_AGENT_SOURCE` for why (PLT/GOT lazy
+        binding is a one-time, argument-independent confound; a warm-up
+        call resolves it before the call actually being measured runs).
+        Off by default: it means the target executes an extra time before
+        being traced, which isn't safe for a target with side effects or
+        other non-idempotent state.
         """
         if self._script is None:
             raise RuntimeError("call spawn() or attach() before trace_call()")
@@ -396,7 +468,7 @@ class VeridiffEngine:
         # strictly after its own send('done') call (same function, sequential
         # statements) -- so every chunk/meta/done message is guaranteed to
         # have already reached _on_message by the time this call returns.
-        self._script.exports_sync.trace_call(hex(address), payload_args, ret_type, module)
+        self._script.exports_sync.trace_call(hex(address), payload_args, ret_type, module, warm_up)
 
         if not self._meta:
             raise RuntimeError("agent produced no trace metadata (target module unresolved)")
@@ -487,6 +559,31 @@ class VeridiffEngine:
             block_b=b[i] if i < len(b) else None,
         )
 
+    # Minimum consecutive blocks that must agree, starting right after a
+    # candidate resync point, before that point is accepted as a real
+    # control-flow merge rather than a coincidental single-block match. A
+    # dispatcher or shared-helper hit is followed by state-dependent blocks
+    # that differ between the two traces almost every time; requiring a
+    # short run of continued agreement is what tells a real merge apart from
+    # a fly-by through shared code, without needing a separate "is this
+    # address unique" pass. Not exposed as a public knob -- 3 held up
+    # against every real and synthetic case this engine has been run
+    # against (including the live PLT-lazy-binding confound and a synthetic
+    # flattening-dispatcher case in the test suite); treat it as an
+    # implementation detail unless a real case demands otherwise.
+    _MIN_CONFIRM = 3
+
+    @staticmethod
+    def _resync_confirmed(a: List[int], b: List[int], p: int, bj: int) -> bool:
+        """Whether a[p:] and b[bj:] agree for `_MIN_CONFIRM` blocks, or for
+        as many as remain if a trace simply ends first (agreeing all the way
+        to the end of the available data is itself full confirmation). Zero
+        blocks available to compare is *not* a confirmation -- there must be
+        at least one point of actual agreement beyond the candidate itself.
+        """
+        length = min(VeridiffEngine._MIN_CONFIRM, len(a) - p, len(b) - bj)
+        return length > 0 and a[p : p + length] == b[bj : bj + length]
+
     @staticmethod
     def find_divergence_regions(
         trace_a: Trace,
@@ -504,6 +601,15 @@ class VeridiffEngine:
         goal here in the first place) -- it is O(N + regions * resync_window)
         and intentionally gives up on a region it can't resync within the
         window rather than searching unboundedly.
+
+        A single shared address is not enough to accept as a resync point:
+        OLLVM-flattened code (and, less exotically, any code with a commonly
+        called helper) routes many logically-different paths through the
+        *same* dispatcher or helper block, so that address will trivially
+        show up in both windows almost immediately after nearly any
+        divergence -- without the two paths actually having merged back into
+        the same control flow. See `_resync_confirmed` for how a candidate
+        earns acceptance instead of just being the first thing found.
         """
         a, b = trace_a.blocks, trace_b.blocks
         i = j = 0
@@ -515,17 +621,34 @@ class VeridiffEngine:
             if i >= len(a) or j >= len(b):
                 break
 
+            b_hi = min(j + resync_window, len(b))
             window_b: Dict[int, int] = {}
-            for k in range(j, min(j + resync_window, len(b))):
+            for k in range(j, b_hi):
                 window_b.setdefault(b[k], k)
 
             resync_a: Optional[int] = None
             resync_b: Optional[int] = None
             resync_val: Optional[int] = None
-            for p in range(i, min(i + resync_window, len(a))):
-                k = window_b.get(a[p])
-                if k is not None:
-                    resync_a, resync_b, resync_val = p, k, a[p]
+            a_hi = min(i + resync_window, len(a))
+            for p in range(i, a_hi):
+                val = a[p]
+                first_bj = window_b.get(val)
+                if first_bj is None:
+                    continue
+                if VeridiffEngine._resync_confirmed(a, b, p, first_bj):
+                    resync_a, resync_b, resync_val = p, first_bj, val
+                    break
+                # `val`'s first occurrence didn't hold up -- exactly the
+                # signature of shared/looped infrastructure rather than a
+                # structural merge. Check whether it recurs *again* later in
+                # b's window before giving up on this candidate address; a
+                # later occurrence can still be the real merge point even
+                # though the first wasn't.
+                for k in range(first_bj + 1, b_hi):
+                    if b[k] == val and VeridiffEngine._resync_confirmed(a, b, p, k):
+                        resync_a, resync_b, resync_val = p, k, val
+                        break
+                if resync_a is not None:
                     break
 
             regions.append(
@@ -565,9 +688,13 @@ if __name__ == "__main__":
     with VeridiffEngine() as engine:
         engine.spawn(program)
 
-        trace_a = engine.trace_call(target_address, [Arg("string", arg_a)], ret_type="int")
-        trace_b = engine.trace_call(target_address, [Arg("string", arg_b)], ret_type="int")
-        engine.resume()
+        # warm_up=True so this demo doesn't itself fall into the PLT/GOT
+        # lazy-binding confound (see Trace.find_divergence_regions' and
+        # trace_call's docstrings) -- without it, run A's first call into
+        # any externally-linked function would show a spurious divergence
+        # against run B that has nothing to do with arg_a vs arg_b.
+        trace_a = engine.trace_call(target_address, [Arg("string", arg_a)], ret_type="int", warm_up=True)
+        trace_b = engine.trace_call(target_address, [Arg("string", arg_b)], ret_type="int", warm_up=True)
 
         print(f"trace A ({arg_a!r}): {len(trace_a.blocks)} blocks, returned {trace_a.return_value}")
         print(f"trace B ({arg_b!r}): {len(trace_b.blocks)} blocks, returned {trace_b.return_value}")
@@ -575,15 +702,26 @@ if __name__ == "__main__":
         divergence = VeridiffEngine.find_first_divergence(trace_a, trace_b)
         if divergence is None:
             print("no divergence: both runs executed identical control flow")
-            raise SystemExit(0)
+        else:
+            fmt = lambda v: hex(v) if v is not None else "(trace ended here)"
+            print(f"\nfirst divergence at trace index {divergence.index}")
+            print(f"  last common block : {fmt(divergence.last_common_block)}")
+            print(f"  run A took block  : {fmt(divergence.block_a)}")
+            print(f"  run B took block  : {fmt(divergence.block_b)}")
 
-        fmt = lambda v: hex(v) if v is not None else "(trace ended here)"
-        print(f"\nfirst divergence at trace index {divergence.index}")
-        print(f"  last common block : {fmt(divergence.last_common_block)}")
-        print(f"  run A took block  : {fmt(divergence.block_a)}")
-        print(f"  run B took block  : {fmt(divergence.block_b)}")
+            if divergence.last_common_block is not None:
+                # Disassembling only reads static code bytes at an address,
+                # so it needs the target mapped, not running -- do it before
+                # resume(), not after. Calling any RPC into the agent after
+                # resume() races the target actually exiting: frida-python
+                # raises a clean InvalidOperationError if it loses that race,
+                # but frida-rust's equivalent call has no such detection and
+                # hangs forever instead (see README field notes).
+                print("\n  disassembly of the deciding block:")
+                for insn in engine.disassemble_block(trace_a, divergence.last_common_block):
+                    marker = "  <-- decides here" if insn.is_conditional_branch else ""
+                    print(f"    {insn.address:#x}  {insn.mnemonic} {insn.op_str}{marker}")
 
-        if divergence.last_common_block is not None:
-            print("\n  disassembly of the deciding block:")
-            for insn in engine.disassemble_block(trace_a, divergence.last_common_block):
-                print(f"    {insn.address:#x}  {insn.mnemonic} {insn.op_str}")
+        # Purely a courtesy: lets the spawned process actually run and exit
+        # instead of being left stopped. Nothing above depends on this.
+        engine.resume()

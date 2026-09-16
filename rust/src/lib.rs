@@ -62,7 +62,7 @@ function nativeArgType(spec) {
 }
 
 rpc.exports = {
-    traceCall(targetHex, args, retType, moduleName) {
+    traceCall(targetHex, args, retType, moduleName, warmUp) {
         const target = ptr(targetHex);
         const mod = moduleName
             ? Process.getModuleByName(moduleName)
@@ -81,6 +81,23 @@ rpc.exports = {
 
         const fn = new NativeFunction(target, retType, args.map(nativeArgType));
         const nativeArgs = args.map(allocArg);
+
+        // Optional pre-execution pass: calls the target once, untraced,
+        // before the real (traced) call below. Exists because of a real,
+        // reproducible confound: a target's first-ever call to an
+        // externally-linked function (strcmp@plt, anything else routed
+        // through the PLT/GOT) takes the dynamic linker's lazy-binding
+        // resolver path, while every later call to that same external
+        // function skips straight to the now-resolved GOT entry -- a
+        // one-time difference in block-level control flow that has nothing
+        // to do with your arguments. Warming up with a fresh, untraced call
+        // using these SAME arguments resolves whatever GOT entries this
+        // exact code path touches before the traced call below runs, so the
+        // trace actually recorded isn't the one paying the resolver tax.
+        if (warmUp) {
+            fn(...nativeArgs);
+        }
+
         const tid = Process.getCurrentThreadId();
 
         let blockCount = 0;
@@ -233,6 +250,47 @@ pub struct Instruction {
     pub raw_bytes: Vec<u8>,
 }
 
+/// ARM64 mnemonics that are conditional branches despite having no
+/// dot-suffix of their own -- see `Instruction::is_conditional_branch`.
+const ARM64_CONDITIONAL_MNEMONICS: [&str; 4] = ["cbz", "cbnz", "tbz", "tbnz"];
+
+impl Instruction {
+    /// Whether this instruction is a conditional branch, across x86 and
+    /// ARM64.
+    ///
+    /// Disassembly itself needs no architecture-specific code --
+    /// `Instruction::parse` (Capstone, via frida-gum) already decodes every
+    /// architecture Frida attaches to. This classification does, because
+    /// Capstone's own `Instruction.groups` doesn't distinguish conditional
+    /// from unconditional branches: verified live against a real x86
+    /// target, a `jne` and the `jmp` two instructions later in the same
+    /// basic block both report `groups: ["branch_relative", "jump"]`, with
+    /// nothing to tell them apart. Mnemonic text is the only signal that
+    /// does, on any architecture, so that's what this checks instead of
+    /// trusting `.groups`.
+    ///
+    /// x86: any `jCC` mnemonic (`jz`, `jne`, `jle`, ...) except the
+    /// unconditional `jmp`.
+    ///
+    /// ARM64: `b.cond` forms (`b.eq`, `b.ne`, `b.lt`, ...; Capstone renders
+    /// the condition as a dot-suffix) plus the compare/test-and-branch
+    /// forms (`cbz`, `cbnz`, `tbz`, `tbnz`), inherently conditional despite
+    /// having no dot-suffix of their own. Plain `b`/`bl`/`br`/`blr` are
+    /// unconditional and correctly fall through to `false`.
+    ///
+    /// Unrecognized mnemonics (ARM32/Thumb, MIPS, anything else Capstone
+    /// supports that this hasn't been taught) return `false` rather than
+    /// guessing -- an unmarked instruction is a safe default; a wrongly
+    /// marked one isn't.
+    pub fn is_conditional_branch(&self) -> bool {
+        let m = self.mnemonic.to_ascii_lowercase();
+        if m.starts_with('j') && m != "jmp" {
+            return true;
+        }
+        m.starts_with("b.") || ARM64_CONDITIONAL_MNEMONICS.contains(&m.as_str())
+    }
+}
+
 /// A single call's dynamic execution path, module-relative.
 ///
 /// `blocks` is the ordered sequence of basic-block start offsets (from
@@ -254,6 +312,23 @@ pub struct Trace {
     pub module_base: u64,
     pub module_size: u64,
     pub return_value: Option<String>,
+}
+
+/// Optional, non-default knobs for `trace_call`. `TraceCallOptions::default()`
+/// is today's existing behavior. A plain trailing `bool` parameter was
+/// deliberately not used here -- `trace_call(.., true)` doesn't self-document
+/// what `true` means at the call site, and every future optional knob would
+/// otherwise mean another breaking positional-parameter addition. A struct
+/// absorbs both problems, and costs nothing at the one call site that sets it.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TraceCallOptions {
+    /// Call the target once, untraced, with the same arguments, immediately
+    /// before the traced call. See `trace_call`'s doc comment for why (PLT/
+    /// GOT lazy binding is a one-time, argument-independent confound this
+    /// resolves ahead of the call actually being measured). Off by default:
+    /// the target executes an extra time before being traced, which isn't
+    /// safe for a target with side effects or other non-idempotent state.
+    pub warm_up: bool,
 }
 
 /// Where two traces' control flow first differs.
@@ -403,6 +478,19 @@ impl TraceBuilder {
                     return; // meta always precedes chunks; ignore stray data otherwise
                 }
                 let module_end = self.module_base + self.module_size;
+                // Upper bound on how many block events this chunk can hold;
+                // reserving it up front turns what would otherwise be
+                // O(log n) incremental reallocations-and-copies across a
+                // multi-million-block trace into (at most) one growth per
+                // chunk. Some of these slots go unused when blocks outside
+                // the target module get filtered below, which just means
+                // `reserve` over-estimates slightly -- never a correctness
+                // issue, only a (small, bounded) over-allocation.
+                let stride = 4 * self.pointer_size;
+                if let Some(max_new) = buf.len().checked_div(stride) {
+                    self.blocks.reserve(max_new);
+                    self.block_ends.reserve(max_new);
+                }
                 for (start, end) in iter_block_events(&buf, self.pointer_size) {
                     if start >= self.module_base && start < module_end {
                         let rel = start - self.module_base;
@@ -467,7 +555,7 @@ impl VeridiffEngine {
     /// `"int64"`, `"uint64"`, `"pointer"`), plus this engine's own `Str`
     /// kind for a `const char *` argument. `module` restricts/normalizes
     /// against a specific module by name; pass `None` to auto-resolve the
-    /// module containing `address`.
+    /// module containing `address`. See `TraceCallOptions` for `options.warm_up`.
     pub fn trace_call(
         &self,
         script: &mut Script,
@@ -475,9 +563,16 @@ impl VeridiffEngine {
         args: &[Arg],
         ret_type: &str,
         module: Option<&str>,
+        options: TraceCallOptions,
     ) -> Result<Trace, VeridiffError> {
         let args_json: Vec<Value> = args.iter().map(Arg::to_json).collect();
-        let call_args = json!([format!("{address:#x}"), args_json, ret_type, module]);
+        let call_args = json!([
+            format!("{address:#x}"),
+            args_json,
+            ret_type,
+            module,
+            options.warm_up,
+        ]);
 
         script
             .exports
@@ -603,6 +698,15 @@ impl VeridiffEngine {
     /// goal here in the first place) -- it is O(N + regions * resync_window)
     /// and intentionally gives up on a region it can't resync within the
     /// window rather than searching unboundedly.
+    ///
+    /// A single shared address is not enough to accept as a resync point:
+    /// OLLVM-flattened code (and, less exotically, any code with a commonly
+    /// called helper) routes many logically-different paths through the
+    /// *same* dispatcher or helper block, so that address will trivially
+    /// show up in both windows almost immediately after nearly any
+    /// divergence -- without the two paths actually having merged back into
+    /// the same control flow. See `resync_confirmed` for how a candidate
+    /// earns acceptance instead of just being the first thing found.
     pub fn find_divergence_regions(
         trace_a: &Trace,
         trace_b: &Trace,
@@ -612,6 +716,11 @@ impl VeridiffEngine {
         let (a, b) = (&trace_a.blocks, &trace_b.blocks);
         let (mut i, mut j) = (0usize, 0usize);
         let mut regions = Vec::new();
+        // Reused across every region found in this call rather than
+        // allocated fresh per region -- clear() drops entries but keeps the
+        // table's backing storage, so a trace with many regions doesn't pay
+        // a fresh hashmap allocation for each one.
+        let mut window_b: HashMap<u64, usize> = HashMap::new();
 
         while regions.len() < max_regions {
             while i < a.len() && j < b.len() && a[i] == b[j] {
@@ -622,16 +731,33 @@ impl VeridiffEngine {
                 break;
             }
 
-            let mut window_b: HashMap<u64, usize> = HashMap::new();
-            for (k, &val) in b.iter().enumerate().skip(j).take(resync_window) {
+            window_b.clear();
+            let b_hi = (j + resync_window).min(b.len());
+            for (k, &val) in b.iter().enumerate().take(b_hi).skip(j) {
                 window_b.entry(val).or_insert(k);
             }
 
             let mut resync: Option<(usize, usize, u64)> = None;
-            for (p, &val) in a.iter().enumerate().skip(i).take(resync_window) {
-                if let Some(&k) = window_b.get(&val) {
-                    resync = Some((p, k, val));
-                    break;
+            let a_hi = (i + resync_window).min(a.len());
+            'search: for (p, &val) in a.iter().enumerate().take(a_hi).skip(i) {
+                let Some(&first_bj) = window_b.get(&val) else {
+                    continue;
+                };
+                if Self::resync_confirmed(a, b, p, first_bj) {
+                    resync = Some((p, first_bj, val));
+                    break 'search;
+                }
+                // `val`'s first occurrence didn't hold up -- exactly the
+                // signature of shared/looped infrastructure rather than a
+                // structural merge (see doc comment above). Before moving on
+                // to the next candidate address, check whether `val` recurs
+                // *again* later in b's window; a later occurrence can still
+                // be the real merge point even though the first wasn't.
+                for k in (first_bj + 1)..b_hi {
+                    if b[k] == val && Self::resync_confirmed(a, b, p, k) {
+                        resync = Some((p, k, val));
+                        break 'search;
+                    }
                 }
             }
 
@@ -651,6 +777,30 @@ impl VeridiffEngine {
             }
         }
         regions
+    }
+
+    /// Minimum consecutive blocks that must agree, starting right after a
+    /// candidate resync point, before that point is accepted as a real
+    /// control-flow merge rather than a coincidental single-block match. A
+    /// dispatcher or shared-helper hit is followed by state-dependent
+    /// blocks that differ between the two traces almost every time;
+    /// requiring a short run of continued agreement is what tells a real
+    /// merge apart from a fly-by through shared code, without needing a
+    /// separate "is this address unique" pass. Not exposed as a public knob
+    /// -- 3 held up against every real and synthetic case this engine has
+    /// been run against (including the live PLT-lazy-binding confound and a
+    /// synthetic flattening-dispatcher case in the test suite below); treat
+    /// it as an implementation detail unless a real case demands otherwise.
+    const MIN_CONFIRM: usize = 3;
+
+    /// Whether `a[p..]` and `b[bj..]` agree for `MIN_CONFIRM` blocks, or for
+    /// as many as remain if one trace simply ends first (agreeing all the
+    /// way to the end of the available data is itself full confirmation).
+    /// Zero blocks available to compare is *not* a confirmation -- there
+    /// must be at least one point of actual agreement beyond the candidate.
+    fn resync_confirmed(a: &[u64], b: &[u64], p: usize, bj: usize) -> bool {
+        let len = Self::MIN_CONFIRM.min(a.len() - p).min(b.len() - bj);
+        len > 0 && a[p..p + len] == b[bj..bj + len]
     }
 }
 
@@ -735,8 +885,11 @@ mod tests {
 
     #[test]
     fn multi_region_resync() {
-        let a = mk_trace(vec![0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70]);
-        let b = mk_trace(vec![0x10, 0x20, 0x31, 0x40, 0x50, 0x61, 0x70]);
+        // Four fully-shared blocks (0x40/0x50/0x55/0x58) separate the two
+        // divergences -- enough runway for MIN_CONFIRM=3 to solidly confirm
+        // the first resync before the second divergence hits.
+        let a = mk_trace(vec![0x10, 0x20, 0x30, 0x40, 0x50, 0x55, 0x58, 0x60, 0x70]);
+        let b = mk_trace(vec![0x10, 0x20, 0x31, 0x40, 0x50, 0x55, 0x58, 0x61, 0x70]);
         let regions = VeridiffEngine::find_divergence_regions(&a, &b, 16, 32);
         assert_eq!(regions.len(), 2);
         assert_eq!(regions[0].branch_a, 0x30);
@@ -753,6 +906,61 @@ mod tests {
         let regions = VeridiffEngine::find_divergence_regions(&a, &b, 2, 32);
         assert_eq!(regions.len(), 1);
         assert_eq!(regions[0].resync_block, None);
+    }
+
+    /// The core claim of the v0.2.0 resync tuning: a single-block hit on a
+    /// shared dispatcher/helper (0xD0 here) must NOT be accepted as a real
+    /// merge when the two traces immediately diverge again afterward --
+    /// exactly the shape of two paths transiting the same OLLVM-flattening
+    /// dispatcher block before dispatching to genuinely different targets.
+    /// The pre-v0.2.0 algorithm (first shared address wins, no
+    /// confirmation) would have wrongly reported 0xD0 as the resync point.
+    #[test]
+    fn dispatcher_style_coincidental_match_is_rejected() {
+        let a = mk_trace(vec![0x10, 0x20, 0x30, 0xD0, 0xAA, 0xAB, 0xAC]);
+        let b = mk_trace(vec![0x10, 0x20, 0x31, 0xD0, 0xBB, 0xBC, 0xBD]);
+        let regions = VeridiffEngine::find_divergence_regions(&a, &b, 16, 32);
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].branch_a, 0x30);
+        assert_eq!(regions[0].branch_b, 0x31);
+        assert_eq!(
+            regions[0].resync_block, None,
+            "a single-block dispatcher fly-by must not be accepted as a real merge"
+        );
+    }
+
+    /// Same shared block 0xD0 as above, but this time both traces genuinely
+    /// continue identically afterward. Paired with the rejection test above,
+    /// this confirms the algorithm discriminates on whether a shared address
+    /// holds up under continued comparison, not on whether it's shared at
+    /// all -- it doesn't become universally suspicious of dispatcher-shaped
+    /// addresses, only of ones that turn out to be coincidental.
+    #[test]
+    fn dispatcher_style_match_is_accepted_when_it_actually_holds_up() {
+        let a = mk_trace(vec![0x10, 0x20, 0x30, 0xD0, 0xAA, 0xAB, 0xAC]);
+        let b = mk_trace(vec![0x10, 0x20, 0x31, 0xD0, 0xAA, 0xAB, 0xAC]);
+        let regions = VeridiffEngine::find_divergence_regions(&a, &b, 16, 32);
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].resync_block, Some(0xD0));
+        assert_eq!(regions[0].resync_index_a, Some(3));
+        assert_eq!(regions[0].resync_index_b, Some(3));
+    }
+
+    /// A candidate whose *first* occurrence in b's window fails to confirm
+    /// must not eliminate that address outright -- a later occurrence of the
+    /// same value can still be the genuine merge point (e.g. a dispatcher
+    /// visited twice before the two paths actually reconverge).
+    #[test]
+    fn later_occurrence_of_a_repeated_value_can_still_confirm() {
+        let a = mk_trace(vec![0x10, 0x20, 0x30, 0xD0, 0xAA, 0xD0, 0xEE, 0xEF, 0xF0]);
+        let b = mk_trace(vec![0x10, 0x20, 0x31, 0xD0, 0xBB, 0xD0, 0xEE, 0xEF, 0xF0]);
+        let regions = VeridiffEngine::find_divergence_regions(&a, &b, 16, 32);
+        assert_eq!(regions.len(), 1);
+        // The first 0xD0 (index 3) fails to confirm (0xAA != 0xBB follows
+        // it); the second 0xD0 (index 5) does, and must be what's reported.
+        assert_eq!(regions[0].resync_block, Some(0xD0));
+        assert_eq!(regions[0].resync_index_a, Some(5));
+        assert_eq!(regions[0].resync_index_b, Some(5));
     }
 
     #[test]
@@ -807,5 +1015,99 @@ mod tests {
     fn hex_decode_round_trips() {
         assert_eq!(hex_decode("48c7c000000000"), vec![0x48, 0xc7, 0xc0, 0x00, 0x00, 0x00, 0x00]);
         assert_eq!(hex_decode(""), Vec::<u8>::new());
+    }
+
+    // ------------------------------------------------------------------
+    // Feature 3: cross-architecture conditional-branch classification.
+    //
+    // Instruction::parse (Capstone, via frida-gum) already decodes every
+    // architecture Frida attaches to -- there is no x86-specific code in
+    // the agent to "extend" for ARM64. What's genuinely missing is
+    // classification: live-verified (see README field notes) that
+    // Capstone's own Instruction.groups does NOT distinguish conditional
+    // from unconditional branches -- a real `jne` and the `jmp` two
+    // instructions later in the same block both report
+    // groups=["branch_relative", "jump"]. Mnemonic text is the only signal
+    // that does, which is what these mock payloads exercise: no live ARM64
+    // hardware is available to this test suite, so ARM64 coverage here is
+    // the classifier alone, fed synthetic (but architecturally accurate)
+    // mnemonics -- not an end-to-end live ARM64 trace.
+    // ------------------------------------------------------------------
+
+    fn mk_insn(mnemonic: &str) -> Instruction {
+        Instruction {
+            address: 0,
+            mnemonic: mnemonic.to_string(),
+            op_str: String::new(),
+            size: 4,
+            raw_bytes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn x86_conditional_jumps_are_recognized() {
+        for m in ["je", "jne", "jz", "jnz", "jl", "jle", "jg", "jge", "ja", "jae", "jb", "jbe", "jcxz"] {
+            assert!(mk_insn(m).is_conditional_branch(), "{m}");
+        }
+    }
+
+    #[test]
+    fn x86_unconditional_jump_is_not_a_conditional_branch() {
+        assert!(!mk_insn("jmp").is_conditional_branch());
+    }
+
+    #[test]
+    fn x86_non_branch_mnemonics_are_not_conditional_branches() {
+        for m in ["mov", "cmp", "call", "ret", "push", "pop", "lea", "test"] {
+            assert!(!mk_insn(m).is_conditional_branch(), "{m}");
+        }
+    }
+
+    #[test]
+    fn arm64_compare_and_test_branches_are_recognized() {
+        for m in ["cbz", "cbnz", "tbz", "tbnz"] {
+            assert!(mk_insn(m).is_conditional_branch(), "{m}");
+        }
+    }
+
+    #[test]
+    fn arm64_b_cond_forms_are_recognized() {
+        for m in ["b.eq", "b.ne", "b.lt", "b.le", "b.gt", "b.ge", "b.hi", "b.ls", "b.mi", "b.pl"] {
+            assert!(mk_insn(m).is_conditional_branch(), "{m}");
+        }
+    }
+
+    #[test]
+    fn arm64_unconditional_branches_are_not_conditional() {
+        for m in ["b", "bl", "br", "blr", "ret"] {
+            assert!(!mk_insn(m).is_conditional_branch(), "{m}");
+        }
+    }
+
+    #[test]
+    fn classification_is_case_insensitive() {
+        // Not observed to matter in practice -- every live capture in this
+        // repo has Capstone/Frida returning lowercase mnemonics -- but the
+        // check is nearly free, so it's defensive rather than assumed.
+        assert!(mk_insn("JNE").is_conditional_branch());
+        assert!(mk_insn("B.EQ").is_conditional_branch());
+        assert!(!mk_insn("JMP").is_conditional_branch());
+    }
+
+    #[test]
+    fn mock_arm64_disassembly_payload_flags_the_decisive_instruction() {
+        // Shaped exactly like what disassemble_block() builds from a real
+        // disassembleRange RPC response -- a mock ARM64 trace payload,
+        // standing in for hardware this suite doesn't have access to.
+        // Models a null-check-shaped block: `cbz x0, +0x18` deciding the
+        // branch.
+        let instructions = [
+            Instruction { address: 0x4009f0, mnemonic: "mov".into(), op_str: "x1, x0".into(), size: 4, raw_bytes: vec![0xe1, 0x03, 0x00, 0xaa] },
+            Instruction { address: 0x4009f4, mnemonic: "cbz".into(), op_str: "x0, #0x4009fc".into(), size: 4, raw_bytes: vec![0x00, 0x00, 0xb0, 0xb4] },
+        ];
+        let decisive: Vec<&Instruction> = instructions.iter().filter(|i| i.is_conditional_branch()).collect();
+        assert_eq!(decisive.len(), 1);
+        assert_eq!(decisive[0].mnemonic, "cbz");
+        assert_eq!(decisive[0].address, 0x4009f4);
     }
 }

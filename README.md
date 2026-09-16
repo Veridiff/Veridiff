@@ -9,6 +9,17 @@ your two runs weren't going to end the same way.
 
 That's the whole product. Not a framework. Not a platform. An engine.
 
+**v0.2.0** adds four things, in the order they were built: a reused-allocation
+pass over the trace-assembly and resync hot paths; an opt-in warm-up call
+that eliminates a real, live-reproduced false positive from dynamic-linker
+lazy binding; cross-architecture (x86 + ARM64) classification of which
+instruction in a block is the actual decision point; and a resync algorithm
+that now requires a match to hold up under continued comparison before
+trusting it, instead of accepting the first coincidental address it finds --
+the difference between correctly walking past an OLLVM dispatcher and being
+fooled by it. Each is covered below, with either a live proof or an honest
+note about what wasn't (and couldn't be) tested live.
+
 ---
 
 ## What this actually is
@@ -58,7 +69,7 @@ $ nm licensecheck | grep check_license
 0000000000401146 T check_license
 
 $ python3 python/main.py ./licensecheck 0x401146 VALID-KEY-123 WRONG-KEY
-trace A ('VALID-KEY-123'): 11 blocks, returned 1
+trace A ('VALID-KEY-123'): 9 blocks, returned 1
 trace B ('WRONG-KEY'): 6 blocks, returned 0
 
 first divergence at trace index 1
@@ -72,8 +83,13 @@ first divergence at trace index 1
     0x401159  mov rax, qword ptr [rbp - 0x18]
     0x40115d  movzx eax, byte ptr [rax]
     0x401160  cmp al, 0x56
-    0x401162  jne 0x40116a
+    0x401162  jne 0x40116a  <-- decides here
 ```
+
+(Trace A is 9 blocks here, not 11 -- v0.1.0's README showed this same run
+before warm-up mode existed. See **Warm-up mode** below for what changed
+and why. The `<-- decides here` marker is v0.2.0's conditional-branch
+classification, covered in **Cross-architecture branch classification**.)
 
 `0x56` is `'V'`. The engine never saw the source. It never saw
 `"VALID-KEY-123"` as a string to search for — it doesn't know what a
@@ -87,7 +103,7 @@ The Rust engine, same binary, same two keys:
 
 ```
 $ cd rust && cargo run --release -- ../licensecheck 0x401146 VALID-KEY-123 WRONG-KEY
-trace A ("VALID-KEY-123"): 11 blocks, returned Some("1")
+trace A ("VALID-KEY-123"): 9 blocks, returned Some("1")
 trace B ("WRONG-KEY"): 6 blocks, returned Some("0")
 
 first divergence at trace index 1
@@ -101,7 +117,7 @@ first divergence at trace index 1
     0x401159  mov rax, qword ptr [rbp - 0x18]
     0x40115d  movzx eax, byte ptr [rax]
     0x401160  cmp al, 0x56
-    0x401162  jne 0x40116a
+    0x401162  jne 0x40116a  <-- decides here
 ```
 
 Identical answer. Two independent implementations, two different
@@ -166,6 +182,118 @@ hosts ask the agent to disassemble the handful of blocks that matter
 guaranteed to match the live target's actual architecture and mode,
 because it's running inside that exact process.
 
+A third, smaller note on the Rust engine specifically: `find_first_divergence`
+and the raw `GumEvent` decode were already allocation-free (plain slice
+scans, no heap traffic) before v0.2.0 — there was nothing to fix there,
+only to state plainly rather than imply otherwise. What v0.2.0 actually
+changed is real but narrower: `reserve()`-ing trace-assembly buffers by
+each chunk's upper-bound event count instead of growing incrementally, and
+reusing one scratch hashmap across every region `find_divergence_regions`
+finds instead of allocating one per region. An unsafe transmute of the raw
+event buffer into a `&[GumEvent]` slice was considered and rejected: a
+`Vec<u8>` arriving over IPC has no alignment guarantee, and reinterpreting
+unaligned bytes as a `#[repr(C)]` struct with 8-byte fields is undefined
+behavior regardless of whether any given CPU tolerates it in practice.
+`from_le_bytes` on a byte slice is the correct idiom and already compiles
+to the same loads.
+
+---
+
+## Warm-up mode
+
+A real, reproducible confound, found by actually tracing a process rather
+than trusting synthetic data: a target's *first-ever* call to an
+externally-linked function (`strcmp`, anything else routed through the
+PLT/GOT) takes the dynamic linker's lazy-binding resolver path. Every later
+call to that same function skips straight to the now-resolved GOT entry.
+Two calls with **identical arguments** can therefore still report a
+divergence -- not because your logic differs, but because one of them paid
+a one-time linker tax the other didn't.
+
+`trace_call(..., warm_up=True)` (Python) / `TraceCallOptions { warm_up: true }`
+(Rust) has the agent call the target once, untraced, with the same
+arguments, immediately before the call that's actually measured -- so
+whatever GOT entries that code path touches are already resolved by the
+time tracing starts. Proof, on the same binary as above, two identical
+`"VALID-KEY-123"` calls:
+
+```
+warm_up=False: divergence = DivergencePoint(index=4, last_common_block=4160, block_a=4166, block_b=4479)
+warm_up=True:  divergence = None
+```
+
+That's the actual raw `repr()` of the return value, decimal fields and all
+-- `last_common_block=4160` is `0x1040`, `strcmp@plt`. Without warm-up, two
+*identical* calls report a divergence there. With it, `find_first_divergence`
+correctly returns nothing to report. Off by default -- it means the target
+executes an extra time before being traced, which isn't safe for a target
+with side effects or other non-idempotent state -- so it's your call to
+opt in.
+
+---
+
+## Resync tuning (OLLVM heuristics)
+
+`find_divergence_regions`' old rule was "the first address both traces
+share, within the lookahead window, is where they resynced." That's wrong
+for exactly the code this tool exists to analyze: OLLVM-flattened control
+flow routes many logically-different paths through the *same* dispatcher
+block, so that address shows up in both windows almost immediately after
+nearly any divergence -- without the two paths having actually merged back
+into the same control flow. The old rule would call that a resync. It isn't
+one; it's two different paths both passing through shared machinery on
+their way to somewhere else.
+
+v0.2.0 requires a candidate to *hold up*: at least three consecutive blocks
+must keep agreeing right after the candidate address before it's accepted
+as a real merge. A dispatcher fly-by is followed by state-dependent blocks
+that differ between the two traces almost every time; a genuine merge keeps
+agreeing. Synthetic proof (no live OLLVM-obfuscated binary was available to
+test this against, so this is exactly what it looks like -- a targeted
+unit test, not a live capture; see `dispatcher_style_coincidental_match_is_rejected`
+and its paired acceptance test in both test suites):
+
+```
+# same shared block (0xD0) in both cases -- only the outcome differs
+a = [0x10, 0x20, 0x30, 0xD0, 0xAA, 0xAB, 0xAC]
+b = [0x10, 0x20, 0x31, 0xD0, 0xBB, 0xBC, 0xBD]   # diverges again right after 0xD0
+  -> resync_block: None                            # correctly rejected
+
+a = [0x10, 0x20, 0x30, 0xD0, 0xAA, 0xAB, 0xAC]
+b = [0x10, 0x20, 0x31, 0xD0, 0xAA, 0xAB, 0xAC]   # genuinely continues identically
+  -> resync_block: Some(0xD0)                       # correctly accepted
+```
+
+---
+
+## Cross-architecture branch classification
+
+`Instruction.parse` (Capstone, via frida-gum) already decodes every
+architecture Frida attaches to, ARM64 included -- there was never any
+x86-specific code in the agent to "extend" for `CBZ`/`CBNZ`/`B.cond`/
+`TBZ`/`TBNZ`. What both engines now add is `is_conditional_branch` on each
+disassembled instruction, so the deciding branch in a block is flagged
+instead of left for you to spot by eye (that's the `<-- decides here`
+marker in the proof output above).
+
+This has to be mnemonic-based, not `Instruction.groups`-based, and that's
+an empirical finding, not a guess: live-captured against the real `jne` in
+the proof output above, Capstone reports `groups: ["branch_relative",
+"jump"]` -- and the *unconditional* `jmp` two instructions later in the
+same block reports the exact same groups. Nothing in `.groups`
+distinguishes them. Mnemonic text is the only signal that does, on any
+architecture, which is what `is_conditional_branch` actually checks.
+
+Honesty about test coverage, since that empirical finding only covers what
+was on hand: the x86 half is live-verified (see above). No ARM64 hardware
+or correctly-configured emulation was available in this environment, so the
+ARM64 half (`cbz`/`cbnz`/`tbz`/`tbnz`/`b.eq`/`b.ne`/...) is verified by unit
+tests against mock disassembly payloads shaped exactly like a real
+`disassembleRange` response, not by an end-to-end live ARM64 trace. The
+underlying disassembly mechanism is Frida's own well-established multi-arch
+Capstone integration, unmodified by this change -- but say so plainly
+rather than imply hardware that wasn't touched.
+
 ---
 
 ## Quickstart
@@ -186,11 +314,22 @@ veridiff = { path = "../Veridiff/rust" }
 ```
 
 ```rust
+let options = TraceCallOptions { warm_up: true };
+let trace = engine.trace_call(&mut script, addr, &args, "int", None, options)?;
 let d = VeridiffEngine::find_first_divergence(&trace_a, &trace_b);
 ```
 
 `src/main.rs` in this repo is nothing but a thin CLI wrapper over that
 same API — read it as a usage example, not as the product.
+
+New in v0.2.0, both languages: `trace_call(..., warm_up=True)` / a
+`TraceCallOptions { warm_up: true }` argument (see **Warm-up mode**), and
+`instruction.is_conditional_branch` / `insn.is_conditional_branch()` on
+every `Instruction` returned by `disassemble_block` (see **Cross-architecture
+branch classification**). Both are additive on the Python side; the Rust
+`trace_call` signature gained a required trailing parameter, which is a
+breaking change for existing callers on this pre-1.0 crate -- pass
+`TraceCallOptions::default()` for the old behavior.
 
 ---
 
@@ -232,7 +371,26 @@ trusting synthetic test data.
   the resolved address. `find_first_divergence` will honestly report
   this as a real difference, because it is one — `find_divergence_regions`
   is what shows you it's a single region that immediately resyncs, at
-  which point you can recognize a PLT stub address and move on.
+  which point you can recognize a PLT stub address and move on. As of
+  v0.2.0 you can also just not have the problem: see **Warm-up mode**.
+
+- **`frida-rust`'s blocking RPC calls have no timeout or dead-session
+  detection.** `Exports::call`'s implementation is a bare
+  `rx.recv().unwrap()` on an internal channel — if the target process
+  exits (including because you called `device.resume()` and its
+  `main()` ran to completion) while a call is in flight, or before the
+  next one starts, that channel never receives anything and the call
+  blocks *forever*, not with an error. Found live: calling
+  `disassemble_block` after `device.resume()` hung this engine's own
+  demo binary indefinitely. `frida-python`'s equivalent detects this
+  and raises `frida.InvalidOperationError: script has been destroyed`
+  cleanly instead — this is Rust-specific. The fix isn't a timeout
+  wrapper, it's ordering: both demos now do every RPC call (trace,
+  diff, disassemble) *before* calling `resume()`, since disassembly
+  only needs the target's static, already-mapped code bytes and was
+  never dependent on the process actually running. `resume()` is the
+  last line in both, purely so the spawned process doesn't get left
+  stopped. If you're extending either demo, keep it that way.
 
 ---
 
@@ -257,7 +415,13 @@ exception:
   Stalker/Interceptor bug above was found: by actually tracing a real
   process and proving the fix against real output.
 - New architecture support — ARM32/Thumb, MIPS, RISC-V, wherever
-  Frida and Capstone already reach and we don't yet.
+  Frida and Capstone already reach and our own classification logic
+  (branch-type detection, and whatever comes after it) doesn't yet.
+  x86 and ARM64 are covered as of v0.2.0; ARM64 by mock-payload unit
+  tests only, since no ARM64 hardware was available to verify live --
+  a real device or correctly-configured emulator to actually run that
+  verification against is exactly the kind of contribution this
+  welcomes.
 - Portability fixes for platforms the current code handles badly.
 
 **We will not merge, ever, under any framing:**
