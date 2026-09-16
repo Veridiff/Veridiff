@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Rust (see rust/.gitignore for the crate-local copy of this rule)
+/rust/target
+
+# OS / editor cruft
+.DS_Store
+.vscode/
+.idea/

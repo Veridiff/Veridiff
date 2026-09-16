@@ -1,0 +1,61 @@
+# Copyright 2026 Veridiff
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+[package]
+name = "veridiff"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Veridiff -- Dynamic Branch Divergence Finder (Rust engine)"
+
+# Split deliberately: `lib.rs` holds the whole importable VeridiffEngine API
+# with zero CLI concerns, so another project can depend on this crate by path
+# (or a `[patch]`/git dependency) and reuse it verbatim. `main.rs` is nothing
+# but a thin usage example over that library, matching the brief's own
+# `if __name__ == '__main__'`-as-example spirit from the Python side.
+[lib]
+name = "veridiff"
+path = "src/lib.rs"
+
+[[bin]]
+name = "veridiff"
+path = "src/main.rs"
+
+[dependencies]
+# "auto-download" makes frida-sys's build script fetch the matching
+# frida-core/frida-gum devkits at build time instead of requiring you to
+# place them under rustc-link-search by hand. Upstream is marked
+# `maintenance = "experimental"` on crates.io.
+#
+# Pinned to a git rev, NOT the crates.io 0.17.2 release, because 0.17.2 has
+# a real soundness bug in Script::handle_message: call_on_message<I> casts
+# the signal's user_data (actually a *mut CallbackHandler) directly to
+# *mut I and calls I::on_message on it -- undefined behavior for any
+# handler that isn't a zero-sized type, i.e. any handler with real state
+# (this engine's handler holds an mpsc::Sender). Confirmed against the
+# actually-downloaded 0.17.2 source, matches frida-rust upstream issue #189
+# (reports include crashes inside atomic_load, garbage field reads, and a
+# Windows SRWLock deadlock), and fixed in commit 080e8a99a5 ("fix(script):
+# on_message UB", PR #239) by routing through cb.script_handler instead.
+# That fix -- plus an earlier one (#235) that replaced the rigid
+# `SendPayload{type,id,result,returns}` struct with a plain
+# `serde_json::Value` payload, which this engine's custom send() messages
+# depend on -- is on main but not yet in a crates.io release, hence the
+# git pin below. Re-check for a >=0.17.3 release before switching back.
+frida = { git = "https://github.com/frida/frida-rust", rev = "7f9c5eaa17c017fbf721d353b7529d5c16e10eab", features = ["auto-download"] }
+serde_json = "1.0"
+
+[profile.release]
+lto = true
+codegen-units = 1

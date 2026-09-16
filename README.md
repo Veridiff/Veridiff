@@ -1,0 +1,287 @@
+════════════════════════════════════════════════════════════════
+  VERIDIFF
+  the exact instruction where two runs of the same code split
+════════════════════════════════════════════════════════════════
+
+Two traces go in. One address comes out: the `cmp` / `jcc` (or
+`tst`/`b.cond`, or whatever your architecture calls it) that decided
+your two runs weren't going to end the same way.
+
+That's the whole product. Not a framework. Not a platform. An engine.
+
+---
+
+## What this actually is
+
+Reverse engineering a license check, an anti-cheat heuristic, or an
+OLLVM-flattened dispatcher usually comes down to the same manual loop:
+run it once with good input, run it again with bad input, and stare
+at two disassembly listings trying to spot where they stopped
+agreeing with each other. That loop doesn't scale past a few hundred
+basic blocks, and it doesn't survive control-flow flattening at all —
+every path already goes through the same dispatcher block, so staring
+at addresses tells you nothing.
+
+Veridiff automates the *diffing*, not the reversing. Attach [Frida](https://frida.re)'s
+Stalker to a thread, run it twice, and get back the one thing that
+actually matters: the last block both runs agreed on, the first block
+they didn't, and the disassembly of the instruction that split them.
+Millions of basic blocks in, one address out.
+
+It ships as two things, on purpose:
+
+- **`python/main.py`** — one file, `pip install frida`, done.
+- **`rust/`** — a real library crate (`src/lib.rs`) plus a thin
+  demo binary (`src/main.rs`), for when Python's call overhead is the
+  bottleneck instead of Frida's own instrumentation cost.
+
+Both expose the same four calls (`trace_call`, `disassemble_block`,
+`find_first_divergence`, `find_divergence_regions`) and produce
+byte-identical results against the same target. Neither one has a
+single line of CLI, GUI, or presentation logic in it. That's not an
+oversight — see **The Law** below.
+
+---
+
+## Proof, Not Promises
+
+No benchmarks against products we've never touched, no "battle-tested
+against Denuvo" fantasy claims. Here is a small, deliberately
+unremarkable C function — [`examples/licensecheck.c`](examples/licensecheck.c) —
+compiled with nothing that makes Frida's job easier, traced twice with
+a valid and an invalid key, on this machine, moments before this
+paragraph was written:
+
+```
+$ gcc -O0 -no-pie -fno-pie -fno-inline -o licensecheck examples/licensecheck.c
+$ nm licensecheck | grep check_license
+0000000000401146 T check_license
+
+$ python3 python/main.py ./licensecheck 0x401146 VALID-KEY-123 WRONG-KEY
+trace A ('VALID-KEY-123'): 11 blocks, returned 1
+trace B ('WRONG-KEY'): 6 blocks, returned 0
+
+first divergence at trace index 1
+  last common block : 0x114e
+  run A took block  : 0x1164
+  run B took block  : 0x116a
+
+  disassembly of the deciding block:
+    0x40114e  mov qword ptr [rbp - 0x18], rdi
+    0x401152  mov dword ptr [rbp - 4], 0
+    0x401159  mov rax, qword ptr [rbp - 0x18]
+    0x40115d  movzx eax, byte ptr [rax]
+    0x401160  cmp al, 0x56
+    0x401162  jne 0x40116a
+```
+
+`0x56` is `'V'`. The engine never saw the source. It never saw
+`"VALID-KEY-123"` as a string to search for — it doesn't know what a
+license key is. It ran two traces, found where they stopped matching,
+and handed back the exact comparison, because that's the first byte
+the two arguments actually disagree on. That's the entire trick, and
+it's the only trick: turn "where did these diverge" into a linear
+scan instead of a stare-at-two-listings exercise.
+
+The Rust engine, same binary, same two keys:
+
+```
+$ cd rust && cargo run --release -- ../licensecheck 0x401146 VALID-KEY-123 WRONG-KEY
+trace A ("VALID-KEY-123"): 11 blocks, returned Some("1")
+trace B ("WRONG-KEY"): 6 blocks, returned Some("0")
+
+first divergence at trace index 1
+  last common block : 0x114e
+  run A took block  : 0x1164
+  run B took block  : 0x116a
+
+  disassembly of the deciding block:
+    0x40114e  mov qword ptr [rbp - 0x18], rdi
+    0x401152  mov dword ptr [rbp - 4], 0
+    0x401159  mov rax, qword ptr [rbp - 0x18]
+    0x40115d  movzx eax, byte ptr [rax]
+    0x401160  cmp al, 0x56
+    0x401162  jne 0x40116a
+```
+
+Identical answer. Two independent implementations, two different
+language runtimes, one ground truth. Go build `licensecheck` yourself
+and run both — the whole point of putting the source in this repo
+instead of just the output is that you don't have to take our word
+for any of this.
+
+---
+
+## How it works
+
+```
+target process                          host (Python / Rust)
+───────────────                         ─────────────────────
+NativeFunction call, run A   ──►   Interceptor.attach bridges into
+  basic blocks execute       ──►   Stalker.follow, which streams the
+                                    RAW GumEvent buffer via send() --
+                                    no Stalker.parse(), no per-event
+                                    JS object, no JSON round-trip
+NativeFunction call, run B   ──►   same path, second trace
+                                              │
+                                              ▼
+                              host decodes the fixed-stride GumEvent
+                              records directly (struct/bytes, O(N))
+                                              │
+                                              ▼
+                              find_first_divergence(trace_a, trace_b)
+                              -- longest-common-prefix scan, O(min(n,m))
+                                              │
+                                              ▼
+                              disassemble just the 1-2 blocks that
+                              actually matter, via the agent's own
+                              Instruction.parse() (no host-side
+                              disassembler dependency, ever)
+```
+
+Two design decisions carry the whole thing, and both are deliberate
+departures from the obvious approach:
+
+**The diff is a prefix scan, not a Myers/LCS diff.** Text-diff
+algorithms solve "what's the minimal edit script between these two
+sequences" — the wrong question here. After a real branch splits two
+paths, they routinely rejoin a shared library call or a common
+epilogue. A minimal-edit-script algorithm reads that coincidental
+address match as "unchanged" and hands you a fragmented, misleading
+alignment instead of the one thing you actually want: the *first*
+point the paths split. A longest-common-prefix scan answers exactly
+that question, in O(min(n,m)) with no hashing, instead of O(N·D) for
+Myers or O(N log N) for the best hash-assisted variants. `find_divergence_regions`
+adds a bounded-lookahead resync on top for the case where a check runs
+several independent conditionals in sequence — still not a general
+diff, still O(N + regions × window), still answering "where did they
+split" rather than "how do these align."
+
+**Disassembly happens inside the agent, not the host.** Frida-gum
+already bundles Capstone and exposes it as `Instruction.parse()`. Both
+hosts ask the agent to disassemble the handful of blocks that matter
+*after* the diff is computed, and get back structured
+`{address, mnemonic, opStr}` records — so neither `main.py` nor
+`lib.rs` carries a disassembler dependency, and the decode is always
+guaranteed to match the live target's actual architecture and mode,
+because it's running inside that exact process.
+
+---
+
+## Quickstart
+
+**Python** — one file, one dependency:
+
+```bash
+pip install frida
+python3 python/main.py <executable> <hex-address-of-target-fn> <arg-a> <arg-b>
+```
+
+**Rust** — a real library, importable by path/git from any other crate:
+
+```toml
+# your Cargo.toml
+[dependencies]
+veridiff = { path = "../Veridiff/rust" }
+```
+
+```rust
+let d = VeridiffEngine::find_first_divergence(&trace_a, &trace_b);
+```
+
+`src/main.rs` in this repo is nothing but a thin CLI wrapper over that
+same API — read it as a usage example, not as the product.
+
+---
+
+## Field notes (landmines we already stepped on)
+
+Reverse engineering tools should tell you where the bodies are
+buried. These cost real debugging time to find; they're documented
+inline in both agents, and repeated here because they're the kind of
+thing you only learn by actually tracing a real process instead of
+trusting synthetic test data.
+
+- **`Stalker.follow()` silently does nothing if you call it from a
+  plain `rpc.exports` handler and then invoke a `NativeFunction`
+  directly.** No error, no event, `blockCount` stays zero forever. It
+  only engages from genuine native execution context — which is why
+  `traceCall` brackets the actual call inside a throwaway
+  `Interceptor.attach(target, {onEnter, onLeave})` instead of calling
+  `Stalker.follow`/`fn()` back to back. If you're extending the agent
+  and your event count is mysteriously zero, this is almost certainly
+  why.
+
+- **The published `frida` Rust crate (`0.17.2` on crates.io) has a
+  real soundness bug** in `Script::handle_message`: it casts the
+  signal's `user_data` to the wrong pointer type before calling a
+  method through it — undefined behavior for any handler that carries
+  real state, matching upstream
+  [issue #189](https://github.com/frida/frida-rust/issues/189) (reported
+  symptoms: crashes inside atomic ops, garbage field reads, a Windows
+  deadlock). Fixed on `main` in commit `080e8a99a5`, not yet in a
+  crates.io release — `rust/Cargo.toml` pins a git rev with the full
+  reasoning inline. **Check for a `>=0.17.3` release before "helpfully"
+  switching that back to a version string.**
+
+- **Two calls with *identical* arguments can still report a spurious
+  first divergence**, if the target's first call to some external
+  function (`strcmp`, anything else that goes through the PLT) hasn't
+  had its GOT entry resolved yet. The first call takes the
+  lazy-binding resolver path; every call after it jumps straight to
+  the resolved address. `find_first_divergence` will honestly report
+  this as a real difference, because it is one — `find_divergence_regions`
+  is what shows you it's a single region that immediately resyncs, at
+  which point you can recognize a PLT stub address and move on.
+
+---
+
+## The Law
+
+Veridiff is a reference-grade core engine, not an application. Its
+entire value is being small, fast, and dependency-light enough to
+embed into *anything* — a CLI, a GUI, a Ghidra or IDA plugin, a CI
+gate, a Discord bot, whatever the next person building on top of it
+needs. Every dependency or abstraction we let into the core is a tax
+paid by every single integrator downstream of us, forever — including
+the ones who never wanted it.
+
+So the rule is simple, and we intend to enforce it without
+exception:
+
+**We welcome, with open arms:**
+- Core algorithm improvements — a faster or more accurate divergence
+  scan, a smarter resync heuristic, a real reduction in allocations
+  or copies on the hot path.
+- Memory and correctness fixes, especially ones found the way the
+  Stalker/Interceptor bug above was found: by actually tracing a real
+  process and proving the fix against real output.
+- New architecture support — ARM32/Thumb, MIPS, RISC-V, wherever
+  Frida and Capstone already reach and we don't yet.
+- Portability fixes for platforms the current code handles badly.
+
+**We will not merge, ever, under any framing:**
+- CLI frameworks. No `argparse`, no `clap`, no flag parsing of any
+  kind. If you want flags, that's a wrapper, not a patch to this repo.
+- GUI code, TUI code, web dashboards, progress bars.
+- Colored terminal output, fancy logging frameworks, spinners —
+  `print()`/`eprintln!()` or nothing.
+- "Convenience" functions that exist only to save a caller three lines
+  at the cost of a new dependency for everyone who doesn't need them.
+- Config file formats, plugin systems, telemetry, auto-update
+  checkers — anything that turns an engine into an application.
+
+This isn't gatekeeping for its own sake — it's the only way a core
+engine stays a core engine instead of slowly becoming somebody's
+particular CLI with an API bolted on as an afterthought. If you want
+a CLI, a GUI, or a Ghidra plugin: **fork the engine, build
+`veridiff-cli` or `veridiff-gui` or `veridiff-ida` on top of it as its
+own project, and depend on this repo like any other library.** We
+mean that as an invitation, not a brush-off — tell us it exists and
+we'll link to it from here.
+
+---
+
+## License
+
+Apache License 2.0 — see [`LICENSE`](LICENSE). Copyright 2026 Veridiff.
