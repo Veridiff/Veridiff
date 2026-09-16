@@ -294,6 +294,28 @@ class Instruction:
         return _is_conditional_branch(self.mnemonic)
 
 
+def _parse_instruction(r: Dict[str, Any]) -> Instruction:
+    """Parses one `disassembleRange` response item into an `Instruction`.
+
+    Every field here comes from this repo's own agent, over JSON -- not
+    external input -- so a missing/misshaped field means a real bug
+    somewhere in this protocol, not hostile input to guard against
+    defensively. Direct dict indexing (not `.get()`) is deliberate: it
+    raises `KeyError` immediately and loudly on that class of bug, the same
+    "fail visibly, don't fabricate a plausible-looking default" choice the
+    Rust engine's `parse_instruction` makes explicitly (see its doc
+    comment) -- this function is just narrow enough that Python's normal
+    indexing already gets you there for free.
+    """
+    return Instruction(
+        address=int(r["address"], 16),
+        mnemonic=r["mnemonic"],
+        op_str=r["opStr"],
+        size=r["size"],
+        raw_bytes=bytes.fromhex(r["bytes"]),
+    )
+
+
 @dataclass
 class Trace:
     """A single call's dynamic execution path, module-relative.
@@ -504,16 +526,7 @@ class VeridiffEngine:
         start_abs = trace.module_base + relative_start
         end_abs = trace.module_base + end
         raw = self._script.exports_sync.disassemble_range(hex(start_abs), hex(end_abs))
-        return [
-            Instruction(
-                address=int(r["address"], 16),
-                mnemonic=r["mnemonic"],
-                op_str=r["opStr"],
-                size=r["size"],
-                raw_bytes=bytes.fromhex(r["bytes"]),
-            )
-            for r in raw
-        ]
+        return [_parse_instruction(r) for r in raw]
 
     # ---- pure algorithmic core: no Frida, no I/O, unit-testable standalone ----
 

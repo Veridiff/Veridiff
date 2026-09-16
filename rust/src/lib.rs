@@ -364,6 +364,12 @@ pub enum VeridiffError {
     IncompleteTrace,
     /// `disassemble_block` was asked for a block this trace never visited.
     UnknownBlock(u64),
+    /// The agent's `disassembleRange` response was missing or misshaped a
+    /// field. Should not happen in practice -- both ends of this protocol
+    /// are this crate's own code -- but this is a `pub fn` on a library:
+    /// an embedder's process should get a `Result::Err` back for a decode
+    /// problem, not have this crate panic and take the caller down with it.
+    MalformedResponse(String),
 }
 
 impl std::fmt::Display for VeridiffError {
@@ -376,6 +382,9 @@ impl std::fmt::Display for VeridiffError {
             VeridiffError::UnknownBlock(addr) => {
                 write!(f, "block {addr:#x} is not present in this trace")
             }
+            VeridiffError::MalformedResponse(detail) => {
+                write!(f, "malformed response from agent: {detail}")
+            }
         }
     }
 }
@@ -386,6 +395,7 @@ impl std::error::Error for VeridiffError {}
 // Agent message plumbing.
 // --------------------------------------------------------------------------
 
+#[derive(Debug)]
 enum AgentEvent {
     Meta {
         pointer_size: usize,
@@ -413,17 +423,41 @@ impl ScriptHandler for RelayHandler {
                 };
                 let event = match kind {
                     "meta" => {
+                        // This runs inside the C callback that dispatches
+                        // Frida's "message" signal (see call_on_message,
+                        // invoked through an `extern "C" fn` boundary) --
+                        // panicking here on malformed data would unwind
+                        // into that boundary and abort the whole host
+                        // process, not just this call, which is far worse
+                        // than the bug that triggered it. But silently
+                        // defaulting a missing moduleBase to 0 would be
+                        // worse in a different way: every subsequent block
+                        // in this trace would get "normalized" against the
+                        // wrong base and look like plausible-but-wrong
+                        // data instead of visibly failing. So: validate all
+                        // fields together, and on any failure, log instead
+                        // of fabricating a Meta event. Downstream, absorb()
+                        // never sees got_meta=true, chunks are dropped, and
+                        // the trace comes back empty -- an obviously wrong
+                        // result instead of a subtly wrong one.
                         let payload = &m.payload;
-                        let module_base_hex = payload["moduleBase"].as_str().unwrap_or("0x0");
-                        AgentEvent::Meta {
-                            pointer_size: payload["pointerSize"].as_u64().unwrap_or(8) as usize,
-                            module_name: payload["moduleName"].as_str().unwrap_or("").to_string(),
-                            module_base: u64::from_str_radix(
-                                module_base_hex.trim_start_matches("0x"),
-                                16,
-                            )
-                            .unwrap_or(0),
-                            module_size: payload["moduleSize"].as_u64().unwrap_or(0),
+                        let parsed = (|| {
+                            Some(AgentEvent::Meta {
+                                pointer_size: payload["pointerSize"].as_u64()? as usize,
+                                module_name: payload["moduleName"].as_str()?.to_string(),
+                                module_base: u64::from_str_radix(
+                                    payload["moduleBase"].as_str()?.trim_start_matches("0x"),
+                                    16,
+                                )
+                                .ok()?,
+                                module_size: payload["moduleSize"].as_u64()?,
+                            })
+                        })();
+                        match parsed {
+                            Some(event) => event,
+                            None => AgentEvent::Log(format!(
+                                "malformed 'meta' message from agent, ignoring: {payload}"
+                            )),
                         }
                     }
                     "chunk" => AgentEvent::Chunk(data.unwrap_or_default()),
@@ -624,23 +658,7 @@ impl VeridiffEngine {
             .and_then(Value::as_array)
             .ok_or(VeridiffError::IncompleteTrace)?;
 
-        Ok(items
-            .iter()
-            .map(|item| Instruction {
-                address: u64::from_str_radix(
-                    item["address"]
-                        .as_str()
-                        .expect("agent always returns a hex address string")
-                        .trim_start_matches("0x"),
-                    16,
-                )
-                .expect("agent always returns a well-formed hex address"),
-                mnemonic: item["mnemonic"].as_str().unwrap_or("").to_string(),
-                op_str: item["opStr"].as_str().unwrap_or("").to_string(),
-                size: item["size"].as_u64().unwrap_or(0) as usize,
-                raw_bytes: hex_decode(item["bytes"].as_str().unwrap_or("")),
-            })
-            .collect())
+        items.iter().map(parse_instruction).collect()
     }
 
     // ---- pure algorithmic core: no Frida, no I/O, unit-testable standalone ----
@@ -811,12 +829,40 @@ fn hex_decode(s: &str) -> Vec<u8> {
         .collect()
 }
 
+/// Parses one `disassembleRange` response item into an `Instruction`.
+///
+/// Every field here comes from this crate's own agent, over JSON -- not
+/// external input -- so a missing/misshaped field means a real bug
+/// somewhere in this protocol, not a hostile or malformed input to guard
+/// against defensively. But `disassemble_block` is a `pub fn` on a library
+/// other processes embed, and it already returns a `Result`: an `Err` costs
+/// this crate nothing and lets the embedder decide what to do, where a
+/// `.expect()` panic would decide for them by taking their process down.
+/// Runs on the caller's own thread (after `Exports::call`'s blocking wait
+/// already returned), not inside a Frida callback, so unlike
+/// `RelayHandler::on_message` there's no FFI-unwind hazard either way --
+/// this is purely an API-design choice, not a safety requirement.
+fn parse_instruction(item: &Value) -> Result<Instruction, VeridiffError> {
+    let bad = |field: &str| VeridiffError::MalformedResponse(format!("{field} missing or wrong type in {item}"));
+
+    let address_hex = item["address"].as_str().ok_or_else(|| bad("address"))?;
+    let address = u64::from_str_radix(address_hex.trim_start_matches("0x"), 16)
+        .map_err(|_| VeridiffError::MalformedResponse(format!("address {address_hex:?} is not valid hex")))?;
+    let mnemonic = item["mnemonic"].as_str().ok_or_else(|| bad("mnemonic"))?.to_string();
+    let op_str = item["opStr"].as_str().ok_or_else(|| bad("opStr"))?.to_string();
+    let size = item["size"].as_u64().ok_or_else(|| bad("size"))? as usize;
+    let bytes_hex = item["bytes"].as_str().ok_or_else(|| bad("bytes"))?;
+
+    Ok(Instruction { address, mnemonic, op_str, size, raw_bytes: hex_decode(bytes_hex) })
+}
+
 // --------------------------------------------------------------------------
 // Tests: pure logic only, no live Frida session required.
 // --------------------------------------------------------------------------
 #[cfg(test)]
 mod tests {
     use super::*;
+    use frida::MessageSend;
 
     fn mk_trace(blocks: Vec<u64>) -> Trace {
         let mut block_ends = HashMap::new();
@@ -1109,5 +1155,88 @@ mod tests {
         assert_eq!(decisive.len(), 1);
         assert_eq!(decisive[0].mnemonic, "cbz");
         assert_eq!(decisive[0].address, 0x4009f4);
+    }
+
+    // ------------------------------------------------------------------
+    // Review pass (2026-09-17): failure-path coverage for the two fixes
+    // below, both found by re-reading the code rather than by any test or
+    // live run turning up wrong behavior. Neither was manifesting in
+    // practice -- both sides of this protocol are this crate's own code,
+    // so a genuinely malformed message has never actually occurred -- but
+    // an untested failure path is exactly the kind of thing that silently
+    // breaks later. See the doc comments on RelayHandler::on_message's
+    // "meta" arm and on `parse_instruction` for the reasoning.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn malformed_meta_message_produces_a_log_not_a_fabricated_meta() {
+        let (tx, rx) = mpsc::channel();
+        let mut handler = RelayHandler { tx };
+        // Missing moduleBase/moduleName/moduleSize entirely.
+        let payload = serde_json::json!({"type": "meta", "pointerSize": 8});
+        handler.on_message(Message::Send(MessageSend { payload }), None);
+
+        match rx.try_recv() {
+            Ok(AgentEvent::Log(_)) => {} // correct: surfaced, not silently defaulted
+            Ok(AgentEvent::Meta { .. }) => panic!("malformed meta must not produce a fabricated Meta event"),
+            other => panic!("expected exactly one Log event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn well_formed_meta_message_still_parses_normally() {
+        // Companion to the test above: the fix must reject bad data
+        // without breaking the good-data path it already had to handle.
+        let (tx, rx) = mpsc::channel();
+        let mut handler = RelayHandler { tx };
+        let payload = serde_json::json!({
+            "type": "meta",
+            "pointerSize": 8,
+            "moduleName": "licensecheck",
+            "moduleBase": "0x400000",
+            "moduleSize": 16424,
+        });
+        handler.on_message(Message::Send(MessageSend { payload }), None);
+
+        match rx.try_recv() {
+            Ok(AgentEvent::Meta { pointer_size, module_name, module_base, module_size }) => {
+                assert_eq!(pointer_size, 8);
+                assert_eq!(module_name, "licensecheck");
+                assert_eq!(module_base, 0x400000);
+                assert_eq!(module_size, 16424);
+            }
+            other => panic!("expected a well-formed Meta event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn malformed_disassembly_item_is_an_error_not_a_panic_or_fabricated_default() {
+        let missing_size = serde_json::json!({
+            "address": "0x401146",
+            "mnemonic": "push",
+            "opStr": "rbp",
+            "bytes": "55",
+        });
+        match parse_instruction(&missing_size) {
+            Err(VeridiffError::MalformedResponse(_)) => {}
+            other => panic!("expected MalformedResponse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn well_formed_disassembly_item_still_parses_normally() {
+        let item = serde_json::json!({
+            "address": "0x401146",
+            "mnemonic": "push",
+            "opStr": "rbp",
+            "size": 1,
+            "bytes": "55",
+        });
+        let insn = parse_instruction(&item).expect("well-formed item must parse");
+        assert_eq!(insn.address, 0x401146);
+        assert_eq!(insn.mnemonic, "push");
+        assert_eq!(insn.op_str, "rbp");
+        assert_eq!(insn.size, 1);
+        assert_eq!(insn.raw_bytes, vec![0x55]);
     }
 }

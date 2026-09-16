@@ -22,6 +22,8 @@ import struct
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).parent))
 import main as veridiff
 
@@ -238,17 +240,42 @@ def test_mock_arm64_disassembly_payload_flags_the_decisive_instruction():
         {"address": "0x4009f0", "mnemonic": "mov", "opStr": "x1, x0", "size": 4, "bytes": "e10300aa"},
         {"address": "0x4009f4", "mnemonic": "cbz", "opStr": "x0, #0x4009fc", "size": 4, "bytes": "0000b0b4"},
     ]
-    instructions = [
-        veridiff.Instruction(
-            address=int(r["address"], 16),
-            mnemonic=r["mnemonic"],
-            op_str=r["opStr"],
-            size=r["size"],
-            raw_bytes=bytes.fromhex(r["bytes"]),
-        )
-        for r in raw_arm64_block
-    ]
+    instructions = [veridiff._parse_instruction(r) for r in raw_arm64_block]
     decisive = [insn for insn in instructions if insn.is_conditional_branch]
     assert len(decisive) == 1
     assert decisive[0].mnemonic == "cbz"
     assert decisive[0].address == 0x4009F4
+
+
+# --------------------------------------------------------------------------
+# Review pass (2026-09-17): failure-path coverage for _parse_instruction.
+#
+# Found by re-reading the code, not by any test or live run turning up
+# wrong behavior -- both ends of this protocol are this repo's own agent,
+# so a genuinely malformed disassembleRange item has never actually
+# occurred. Direct dict indexing (not `.get()`) was already the right
+# choice here -- it raises KeyError immediately rather than fabricating a
+# plausible-looking default -- but it was untested and inline. This locks
+# the behavior in and matches the Rust engine's explicit
+# MalformedResponse error for the same case (see its doc comment on
+# parse_instruction for the fuller reasoning, including why Rust returns
+# a Result here instead of panicking: disassemble_block is a public
+# library entry point, and a panic there would take an embedder's whole
+# process down for what should be a recoverable error).
+# --------------------------------------------------------------------------
+
+
+def test_malformed_disassembly_item_raises_immediately():
+    missing_size = {"address": "0x401146", "mnemonic": "push", "opStr": "rbp", "bytes": "55"}
+    with pytest.raises(KeyError):
+        veridiff._parse_instruction(missing_size)
+
+
+def test_well_formed_disassembly_item_still_parses_normally():
+    item = {"address": "0x401146", "mnemonic": "push", "opStr": "rbp", "size": 1, "bytes": "55"}
+    insn = veridiff._parse_instruction(item)
+    assert insn.address == 0x401146
+    assert insn.mnemonic == "push"
+    assert insn.op_str == "rbp"
+    assert insn.size == 1
+    assert insn.raw_bytes == b"\x55"
