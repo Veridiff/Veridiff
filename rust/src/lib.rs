@@ -80,7 +80,6 @@ rpc.exports = {
         });
 
         const fn = new NativeFunction(target, retType, args.map(nativeArgType));
-        const nativeArgs = args.map(allocArg);
 
         // Optional pre-execution pass: calls the target once, untraced,
         // before the real (traced) call below. Exists because of a real,
@@ -94,9 +93,24 @@ rpc.exports = {
         // using these SAME arguments resolves whatever GOT entries this
         // exact code path touches before the traced call below runs, so the
         // trace actually recorded isn't the one paying the resolver tax.
+        //
+        // Uses its OWN allocArg() pass -- args.map(allocArg) again, not the
+        // nativeArgs built below -- deliberately, not redundantly. Found by
+        // an independent review pass: a 'string' arg is a pointer to one
+        // Memory.allocUtf8String buffer; reusing that same allocation for
+        // both calls means a target that decodes/transforms its argument
+        // in place (routine for the obfuscated checks this tool targets)
+        // would have the untraced warm-up call mutate the buffer the traced
+        // call then reads -- silently tracing execution over already-
+        // mutated input instead of the caller's actual argument. A 'string'
+        // arg is the only kind this matters for: 'pointer' args wrap
+        // caller-owned memory this agent doesn't allocate and has no
+        // business duplicating, and every other kind is an immutable value,
+        // not shared mutable storage.
         if (warmUp) {
-            fn(...nativeArgs);
+            fn(...args.map(allocArg));
         }
+        const nativeArgs = args.map(allocArg);
 
         const tid = Process.getCurrentThreadId();
 
@@ -713,9 +727,22 @@ impl VeridiffEngine {
     /// blocks ahead in each trace for a value they share, jump both cursors
     /// there, and continue. This is a heuristic, not a minimal alignment
     /// (see `find_first_divergence` for why minimal alignment is the wrong
-    /// goal here in the first place) -- it is O(N + regions * resync_window)
-    /// and intentionally gives up on a region it can't resync within the
-    /// window rather than searching unboundedly.
+    /// goal here in the first place), and it intentionally gives up on a
+    /// region it can't resync within the window rather than searching
+    /// unboundedly. Typical-case cost is O(N + regions * resync_window):
+    /// most candidates simply aren't present in the other trace's window at
+    /// all, an O(1) hashmap miss. Worst case is O(N + regions *
+    /// resync_window^2): a candidate whose value recurs throughout the
+    /// window (a dispatcher hit on every loop iteration, say) triggers an
+    /// O(resync_window) fallback re-scan on every one of up to
+    /// resync_window outer candidates before the outer search gives up on
+    /// that region. Flagged by an independent review pass, not hit in
+    /// practice against any real or synthetic case run through this engine
+    /// so far -- accepted rather than fixed with an explicit comparison
+    /// budget, since `resync_window` already bounds the pathological case
+    /// to a fixed, known worst cost, and a budget mechanism would be new
+    /// machinery on a hot path to shave a constant this engine hasn't
+    /// needed shaved.
     ///
     /// A single shared address is not enough to accept as a resync point:
     /// OLLVM-flattened code (and, less exotically, any code with a commonly
@@ -811,14 +838,41 @@ impl VeridiffEngine {
     /// it as an implementation detail unless a real case demands otherwise.
     const MIN_CONFIRM: usize = 3;
 
-    /// Whether `a[p..]` and `b[bj..]` agree for `MIN_CONFIRM` blocks, or for
-    /// as many as remain if one trace simply ends first (agreeing all the
-    /// way to the end of the available data is itself full confirmation).
-    /// Zero blocks available to compare is *not* a confirmation -- there
-    /// must be at least one point of actual agreement beyond the candidate.
+    /// Whether the candidate `(p, bj)` is confirmed by what comes *after*
+    /// it: up to `MIN_CONFIRM` blocks strictly beyond the candidate in both
+    /// traces, required to agree.
+    ///
+    /// Found by an independent review pass (2026-09-17), not by any test:
+    /// the original version of this function compared `a[p..p+len]` against
+    /// `b[bj..bj+len]` -- starting AT the candidate, not after it. Since
+    /// `bj` is only ever looked up because `b[bj] == a[p]` already, that
+    /// leading element is a trivial self-match by construction. Whenever
+    /// one trace happened to end exactly at the candidate (`a.len()-p == 1`
+    /// or `b.len()-bj == 1`), `len` collapsed to 1 and the "confirmation"
+    /// compared literally nothing but that tautology -- silently defeating
+    /// the entire point of MIN_CONFIRM in precisely the single-block-fly-by
+    /// case it exists to reject. Concretely:
+    /// `a=[0x10,0x20,0x30,0xD0]` vs `b=[0x10,0x20,0x31,0xD0,0xBB,0xBC,0xBD]`
+    /// -- trace A ends right at the shared dispatcher `0xD0`, trace B has
+    /// three more (never-examined, genuinely different) blocks after it --
+    /// used to confirm `0xD0` as a real merge on zero real evidence.
+    ///
+    /// The two traces ending at exactly the same point is a different,
+    /// legitimate case, not the bug above: if BOTH are exhausted right at
+    /// the candidate, there is provably nothing left in either trace that
+    /// could disagree -- that's exhaustive evidence, not absent evidence,
+    /// and is accepted. It's specifically the *asymmetric* case -- one
+    /// trace exhausted, the other still has unexamined blocks -- that must
+    /// be rejected, because the continuing trace's future was simply never
+    /// looked at.
     fn resync_confirmed(a: &[u64], b: &[u64], p: usize, bj: usize) -> bool {
-        let len = Self::MIN_CONFIRM.min(a.len() - p).min(b.len() - bj);
-        len > 0 && a[p..p + len] == b[bj..bj + len]
+        let a_remaining = a.len() - (p + 1);
+        let b_remaining = b.len() - (bj + 1);
+        if a_remaining == 0 && b_remaining == 0 {
+            return true; // both traces end here together -- nothing left to disagree on
+        }
+        let len = Self::MIN_CONFIRM.min(a_remaining).min(b_remaining);
+        len > 0 && a[p + 1..p + 1 + len] == b[bj + 1..bj + 1 + len]
     }
 }
 
@@ -1007,6 +1061,43 @@ mod tests {
         assert_eq!(regions[0].resync_block, Some(0xD0));
         assert_eq!(regions[0].resync_index_a, Some(5));
         assert_eq!(regions[0].resync_index_b, Some(5));
+    }
+
+    /// Regression test for the resync_confirmed bug found in the
+    /// 2026-09-17 review pass (see its doc comment for the full
+    /// explanation). Trace A ends exactly at the shared dispatcher 0xD0;
+    /// trace B has three further, genuinely different blocks after it that
+    /// were never examined. Must NOT confirm -- before the fix, this
+    /// exact shape confirmed on zero real evidence, silently defeating the
+    /// whole point of MIN_CONFIRM.
+    #[test]
+    fn resync_is_rejected_when_only_one_trace_is_exhausted_at_the_candidate() {
+        let a = mk_trace(vec![0x10, 0x20, 0x30, 0xD0]);
+        let b = mk_trace(vec![0x10, 0x20, 0x31, 0xD0, 0xBB, 0xBC, 0xBD]);
+        let regions = VeridiffEngine::find_divergence_regions(&a, &b, 16, 32);
+        assert_eq!(regions.len(), 1);
+        assert_eq!(
+            regions[0].resync_block, None,
+            "trace A ending at the candidate must not vacuously confirm it while trace B's \
+             remaining blocks go unexamined"
+        );
+    }
+
+    /// Companion to the test above: BOTH traces ending together, right at
+    /// the candidate, is the legitimate case resync_confirmed's early
+    /// return covers -- there is nothing left in either trace that could
+    /// disagree, which is exhaustive evidence, not absent evidence.
+    /// multi_region_resync's second region exercises this shape
+    /// incidentally; this test names and isolates it explicitly.
+    #[test]
+    fn resync_is_accepted_when_both_traces_are_exhausted_together_at_the_candidate() {
+        let a = mk_trace(vec![0x10, 0x20, 0x30, 0xD0]);
+        let b = mk_trace(vec![0x10, 0x20, 0x31, 0xD0]);
+        let regions = VeridiffEngine::find_divergence_regions(&a, &b, 16, 32);
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].resync_block, Some(0xD0));
+        assert_eq!(regions[0].resync_index_a, Some(3));
+        assert_eq!(regions[0].resync_index_b, Some(3));
     }
 
     #[test]

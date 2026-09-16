@@ -157,6 +157,40 @@ def test_later_occurrence_of_a_repeated_value_can_still_confirm():
     assert regions[0].resync_index_b == 5
 
 
+def test_resync_is_rejected_when_only_one_trace_is_exhausted_at_the_candidate():
+    # Regression test for the _resync_confirmed bug found in the
+    # 2026-09-17 review pass (see its docstring for the full explanation).
+    # Trace A ends exactly at the shared dispatcher 0xD0; trace B has three
+    # further, genuinely different blocks after it that were never
+    # examined. Must NOT confirm -- before the fix, this exact shape
+    # confirmed on zero real evidence, silently defeating the whole point
+    # of _MIN_CONFIRM.
+    a = mk_trace([0x10, 0x20, 0x30, 0xD0])
+    b = mk_trace([0x10, 0x20, 0x31, 0xD0, 0xBB, 0xBC, 0xBD])
+    regions = veridiff.VeridiffEngine.find_divergence_regions(a, b, resync_window=16)
+    assert len(regions) == 1
+    assert regions[0].resync_block is None, (
+        "trace A ending at the candidate must not vacuously confirm it while "
+        "trace B's remaining blocks go unexamined"
+    )
+
+
+def test_resync_is_accepted_when_both_traces_are_exhausted_together_at_the_candidate():
+    # Companion to the test above: BOTH traces ending together, right at
+    # the candidate, is the legitimate case _resync_confirmed's early
+    # return covers -- there is nothing left in either trace that could
+    # disagree, which is exhaustive evidence, not absent evidence.
+    # test_multi_region_resync exercises this shape incidentally; this test
+    # names and isolates it explicitly.
+    a = mk_trace([0x10, 0x20, 0x30, 0xD0])
+    b = mk_trace([0x10, 0x20, 0x31, 0xD0])
+    regions = veridiff.VeridiffEngine.find_divergence_regions(a, b, resync_window=16)
+    assert len(regions) == 1
+    assert regions[0].resync_block == 0xD0
+    assert regions[0].resync_index_a == 3
+    assert regions[0].resync_index_b == 3
+
+
 def test_block_event_parsing_64bit_skips_non_block_records():
     call_event = struct.pack("<IxxxxQQi", 1, 0x1111, 0x2222, 3) + b"\x00" * 4
     block_event = struct.pack("<IxxxxQQ", veridiff._GUM_BLOCK, 0x401000, 0x401010) + b"\x00" * 8
