@@ -9,14 +9,12 @@ your two runs weren't going to end the same way.
 
 That's the whole product. Not a framework. Not a platform. An engine.
 
-**Current release: v0.2.2.** Documentation restructuring, not code: this
-file now covers only the latest release, and [`CHANGELOG.md`](CHANGELOG.md)
-carries the full history back to 0.1.0 -- read that for what warm-up mode,
-ARM64 classification, and tuned resync actually are, and for the two real
-bugs a review pass found and fixed in each shortly after they shipped.
-v0.2.2 also investigated live ARM64 testing against a real rooted Android
-device; that didn't succeed end to end, and says so plainly below in
-**Field notes** rather than claiming otherwise.
+**Current release: v0.2.3.** ARM64 is now live-verified end to end, on
+real hardware, in both engines -- see **Proof, Not Promises** below. The
+same `examples/licensecheck.c` used for the x86 proof needed zero changes
+to prove it: one source, two architectures. [`CHANGELOG.md`](CHANGELOG.md)
+carries the full history back to 0.1.0, including what it took to get
+here and two more latent bugs a review pass found in the process.
 
 ---
 
@@ -123,6 +121,46 @@ language runtimes, one ground truth. Go build `licensecheck` yourself
 and run both — the whole point of putting the source in this repo
 instead of just the output is that you don't have to take our word
 for any of this.
+
+Same source file, cross-compiled for Android instead of the host, spawned
+and traced on a real rooted phone (POCO F7 Ultra, Android 16, `arm64-v8a`)
+over `adb`, same two keys:
+
+```
+$ $ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android26-clang \
+    -O0 -fno-inline -o licensecheck-arm64 examples/licensecheck.c
+$ adb push licensecheck-arm64 /data/local/tmp/licensecheck-arm64 && adb shell chmod 755 /data/local/tmp/licensecheck-arm64
+$ $NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm licensecheck-arm64 | grep check_license
+0000000000000798 T check_license
+
+trace A ('VALID-KEY-123'): 12 blocks, returned 1
+trace B ('WRONG-KEY'): 9 blocks, returned 0
+
+first divergence at trace index 1
+  last common block : 0x7a8
+  run A took block  : 0x7bc
+  run B took block  : 0x7d0
+
+  disassembly of the deciding block:
+    0x5b247bc7a8  str wzr, [sp, #0xc]
+    0x5b247bc7ac  ldr x8, [sp, #0x10]
+    0x5b247bc7b0  ldrb w8, [x8]
+    0x5b247bc7b4  subs w8, w8, #0x56
+    0x5b247bc7b8  b.ne #0x5b247bc7d0  <-- decides here
+```
+
+`0x56` is `'V'`, same as x86 -- `subs`/`b.ne` instead of `cmp`/`jne`, same
+decision, correctly identified as the deciding instruction by the exact
+same `is_conditional_branch` classifier the x86 proof exercises, on a
+completely different instruction set. Both engines produce this same
+result (block counts, divergence point, disassembly) against the same
+binary -- only the addresses differ, because ASLR gives every run of a
+PIE executable a different load address, which is exactly why the module
+base gets resolved at trace time rather than assumed. No source change
+between this and the x86 build above -- `examples/licensecheck.c` is
+untouched; only the compiler target changed. Full walkthrough, including
+why this needs `spawn()` (not `attach()` to a system-library hook) and
+what didn't work first, is in **Field notes** below.
 
 ---
 
@@ -282,19 +320,17 @@ same block reports the exact same groups. Nothing in `.groups`
 distinguishes them. Mnemonic text is the only signal that does, on any
 architecture, which is what `is_conditional_branch` actually checks.
 
-Honesty about test coverage, since that empirical finding only covers what
-was on hand: the x86 half is live-verified (see above). The ARM64 half
-(`cbz`/`cbnz`/`tbz`/`tbnz`/`b.eq`/`b.ne`/...) is verified by unit tests
-against mock disassembly payloads shaped exactly like a real
-`disassembleRange` response, not by an end-to-end live ARM64 trace --
-real ARM64 hardware was made available in v0.2.2 specifically to close
-this gap, and the attempt is documented honestly in **Field notes**
-below: it did not succeed end to end, for reasons that turned out to be
-about Frida's injection mechanism and Android's hardening, not about this
-engine. The underlying disassembly mechanism is Frida's own
+Both halves are now live-verified. The x86 half was from the start (see
+above); the ARM64 half (`cbz`/`cbnz`/`tbz`/`tbnz`/`b.eq`/`b.ne`/...) was
+mock-tested only through v0.2.2, closed in v0.2.3 by the real ARM64 trace
+in **Proof, Not Promises** above -- `b.ne` correctly flagged as the
+deciding instruction against real Bionic code on a real device, not a
+synthetic payload. Getting there took two attempts and surfaced real
+Frida/Android landmines along the way; see **Field notes** for the full
+account, since a tool built for reverse engineers should show its own
+work. The underlying disassembly mechanism is still Frida's own
 well-established multi-arch Capstone integration, unmodified by this
-change either way -- but say so plainly rather than imply hardware that
-wasn't successfully exercised.
+change -- what changed is evidence, not the mechanism.
 
 ---
 
@@ -425,40 +461,52 @@ trusting synthetic test data.
   live-verified against a self-mutating target specifically — none was
   built to test it, said plainly rather than implied.
 
-- **Live ARM64 testing (v0.2.2) surfaced two real Frida/Android landmines
-  before the tracing pipeline ever got exercised.** Tried against a rooted
-  POCO F7 Ultra, Android 16, arm64-v8a:
+- **Live ARM64 testing took two attempts across v0.2.2 and v0.2.3, and the
+  two failures on the way are as worth documenting as the eventual
+  success.** Against a rooted POCO F7 Ultra, Android 16, `arm64-v8a`:
 
-  1. Frida cannot inject into a statically-linked ELF binary on this
-     device. A cross-compiled, statically-linked test target (the obvious
-     first move — no NDK required, no runtime dependencies to push) failed
+  1. **Frida cannot inject into a statically-linked ELF binary on this
+     device.** The first, obvious move — cross-compile the test target
+     statically, no NDK required, no runtime dependencies to push — failed
      identically for both `spawn()` and `attach()`:
      `frida.NotSupportedError: bootstrapper crashed with signal 11`.
      Attach crashing the same way as spawn rules out spawn-gating
-     specifically — the actual cause is almost certainly that Frida's
+     specifically — the real cause is almost certainly that Frida's
      injection depends on the target having a dynamic linker to `dlopen()`
      the agent into, which a fully static binary never touches at all.
-     Not a Veridiff bug; a property of Frida's injection mechanism. Any
-     ARM64 target needs to be dynamically linked against Bionic.
-  2. `Interceptor.attach` on a function inside hardened Bionic `libc.so`
-     (tried: `strcmp`) crashed the target process — reproducibly, twice.
-     The same hook mechanism on a function inside a normal app's own
-     bundled native library (tried: Chrome Beta's `base.odex`) installed
-     and survived cleanly. That contrast is real signal: whatever's
-     happening is specific to hooking hardened system libraries, not
-     "Frida can't hook anything on this device." The likely cause is
-     ARM64 control-flow hardening (PAC/BTI/CFI) on `libc.so` in a current
+     Not a Veridiff bug; a property of Frida's injection mechanism. Fixed
+     by building with the Android NDK instead (`aarch64-linux-android26-clang`,
+     no `-static`) — a normal PIE executable, dynamically linked against
+     `/system/bin/linker64`, and injection just worked. `examples/licensecheck.c`
+     itself needed zero changes; only the compiler did.
+  2. **`Interceptor.attach` on a function inside hardened Bionic `libc.so`**
+     (tried: `strcmp`) **crashed the target process** — reproducibly,
+     twice, in the direct-libc-hook attempt that preceded the NDK build
+     above. The same hook mechanism on a function inside a normal app's
+     own bundled native library (tried: Chrome Beta's `base.odex`)
+     installed and survived cleanly, which is why the eventual successful
+     run traces the *test binary's own* `check_license`, not a system
+     library function reached through it. Likely cause: ARM64
+     control-flow hardening (PAC/BTI/CFI) on `libc.so` on a current
      Android build conflicting with inline hooking — a reasonable
      hypothesis given the evidence, held to a lower confidence bar than
-     the static-binary finding above, which is confirmed.
+     the static-binary finding above, which is confirmed. Not re-tested
+     since working around it, so this remains a live landmine for anyone
+     hooking system libraries specifically, not just a historical note.
 
-  Net result: the engine's own device-selection design needed zero
-  changes to point at the phone (Python's `VeridiffEngine(device=...)`
-  already took an arbitrary device; Rust's engine not owning a `Device`
-  meant the caller just used `DeviceType::USB` instead of local) — but no
-  end-to-end ARM64 divergence trace was produced. Said plainly rather than
-  claimed. The next attempt should start from a dynamically-linked
-  target's *own* code, per the one experiment that worked.
+  What finally worked, once the target was a proper NDK build: `spawn()`
+  directly (no sleep-and-attach workaround needed for a normal
+  dynamically-linked binary — that workaround was only ever needed while
+  chasing the static-binary and hardened-libc dead ends above), then the
+  same `trace_call`/`find_first_divergence`/`disassemble_block` sequence
+  as any other target, module-base resolved once up front since Android
+  requires PIE. The engine's own device-selection design needed zero
+  changes to point at the phone through any of this — Python's
+  `VeridiffEngine(device=...)` already took an arbitrary device, and
+  Rust's engine not owning a `Device` meant the caller just used
+  `DeviceType::USB` instead of local. Every real obstacle was in the
+  target binary and Frida's injection layer, never in this engine. Full
+  build recipe in `CLAUDE.md`'s Testing section.
 
 ---
 
@@ -484,15 +532,9 @@ exception:
   process and proving the fix against real output.
 - New architecture support — ARM32/Thumb, MIPS, RISC-V, wherever
   Frida and Capstone already reach and our own classification logic
-  (branch-type detection, and whatever comes after it) doesn't yet.
-  x86 and ARM64 are covered in `is_conditional_branch`'s classification
-  logic as of v0.2.0; ARM64 still only by mock-payload unit tests, not a
-  live trace — real hardware was tried in v0.2.2 and the tracing pipeline
-  itself didn't come up cleanly on it (see Field notes), so this is now a
-  known, investigated gap rather than an untried one. Getting a real ARM64
-  divergence trace end to end — starting from a dynamically-linked
-  target's own code, per the one experiment that did work — is exactly
-  the kind of contribution this welcomes.
+  (branch-type detection, and whatever comes after it) doesn't yet. x86
+  and ARM64 are both live-verified as of v0.2.3 (see **Proof, Not
+  Promises**); ARM32/Thumb, MIPS, and RISC-V remain untried.
 - Portability fixes for platforms the current code handles badly.
 
 **We will not merge, ever, under any framing:**

@@ -5,6 +5,45 @@ Changelog](https://keepachangelog.com/en/1.1.0/) format. Versioning
 follows [Semantic Versioning](https://semver.org/); pre-1.0, a minor bump
 may include breaking changes, per semver's own pre-1.0 carve-out.
 
+## [0.2.3] - 2026-09-17
+
+### Fixed
+- `hex_decode` (Rust) silently dropped a malformed byte pair (odd length,
+  non-hex characters) instead of erroring, so a malformed `bytes` field in
+  a `disassembleRange` response would have passed through `parse_instruction`
+  as a shorter-than-expected `raw_bytes` rather than the loud
+  `MalformedResponse` every other field in that function already gets.
+  Fixed by cross-checking the decoded length against the agent-reported
+  `size`. Found in the same review pass that added `MalformedResponse`
+  itself, for consistency -- never observed to actually happen. Python's
+  `bytes.fromhex()` already raised `ValueError` on the same malformed
+  input, so only the Rust side needed this.
+
+### Added
+- **Live ARM64 verification, closing the gap v0.2.2 left open.** Both
+  engines, real hardware (POCO F7 Ultra, Android 16, `arm64-v8a`),
+  identical results to each other and structurally identical to the
+  existing x86 proof: `examples/licensecheck.c`, cross-compiled with the
+  Android NDK instead of the host's `gcc` (no source changes), `spawn()`ed
+  and traced over `adb`/USB. `b.ne` (ARM64's conditional branch, where x86
+  uses `jne`) correctly identified as the deciding instruction by the same
+  `is_conditional_branch` classifier introduced in 0.2.0 as mock-tested
+  only. Full reproducible recipe in `CLAUDE.md`'s Testing section.
+  Getting here took two failed attempts, both documented (README Field
+  Notes, `CLAUDE.md`): Frida cannot inject into a statically-linked ELF
+  binary (fixed by building with the NDK, dynamically linked, instead),
+  and hooking a function inside hardened Bionic `libc.so` crashes the
+  target process while hooking a normal app's own native library doesn't
+  (sidestepped by tracing the test binary's own code rather than a system
+  library function). Neither was a Veridiff bug.
+
+### Changed
+- README and `CLAUDE.md`'s ARM64 sections rewritten throughout to reflect
+  the successful result -- the "not yet successful end to end" framing
+  from 0.2.2 is gone; the two real technical findings that framing was
+  protecting are kept, since they're still true and still useful to
+  whoever touches this next.
+
 ## [0.2.2] - 2026-09-17
 
 ### Added

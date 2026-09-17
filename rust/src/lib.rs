@@ -913,7 +913,25 @@ fn parse_instruction(item: &Value) -> Result<Instruction, VeridiffError> {
     let size = item["size"].as_u64().ok_or_else(|| bad("size"))? as usize;
     let bytes_hex = item["bytes"].as_str().ok_or_else(|| bad("bytes"))?;
 
-    Ok(Instruction { address, mnemonic, op_str, size, raw_bytes: hex_decode(bytes_hex) })
+    // hex_decode() silently drops a malformed pair (odd length, non-hex
+    // chars) rather than erroring -- fine for a private helper, but it
+    // means a malformed `bytes` field would otherwise pass through as a
+    // shorter-than-expected raw_bytes instead of the loud failure every
+    // other field here gets. Checking the decoded length against `size`
+    // (which the agent always sets to the true byte count) catches that
+    // silently, the same "fail loud on our own protocol" standard as the
+    // rest of this function -- found in the same review pass as the
+    // MalformedResponse variant itself, for consistency, not because it
+    // was ever observed to actually happen.
+    let raw_bytes = hex_decode(bytes_hex);
+    if raw_bytes.len() != size {
+        return Err(VeridiffError::MalformedResponse(format!(
+            "bytes field {bytes_hex:?} decoded to {} bytes, expected {size}",
+            raw_bytes.len()
+        )));
+    }
+
+    Ok(Instruction { address, mnemonic, op_str, size, raw_bytes })
 }
 
 // --------------------------------------------------------------------------
@@ -1335,5 +1353,20 @@ mod tests {
         assert_eq!(insn.op_str, "rbp");
         assert_eq!(insn.size, 1);
         assert_eq!(insn.raw_bytes, vec![0x55]);
+    }
+
+    #[test]
+    fn bytes_field_shorter_than_size_is_an_error_not_a_silent_truncation() {
+        // hex_decode() would otherwise silently drop the malformed trailing
+        // "5" (odd-length) rather than erroring; parse_instruction must
+        // catch that via the size cross-check instead of returning a
+        // 1-byte raw_bytes for a declared size of 2.
+        let item = serde_json::json!({
+            "address": "0x401146", "mnemonic": "push", "opStr": "rbp", "size": 2, "bytes": "555",
+        });
+        match parse_instruction(&item) {
+            Err(VeridiffError::MalformedResponse(_)) => {}
+            other => panic!("expected MalformedResponse, got {other:?}"),
+        }
     }
 }
