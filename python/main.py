@@ -32,7 +32,7 @@ import sys
 from dataclasses import dataclass
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple, Union
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 try:
     import frida  # type: ignore

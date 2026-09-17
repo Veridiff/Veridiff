@@ -370,7 +370,13 @@ pub struct DivergenceRegion {
 
 /// Errors from the live-tracing half of the engine. The pure diff functions
 /// (`find_first_divergence`, `find_divergence_regions`) never return this.
+///
+/// `#[non_exhaustive]` since 0.2.1, added along with the `MalformedResponse`
+/// variant it should have had from the start: a new variant is otherwise a
+/// breaking change for any caller that matches this exhaustively, which
+/// isn't a distinction a 0.x patch release should be forced to respect.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum VeridiffError {
     /// The agent's `traceCall`/`disassembleRange` RPC threw or transport-failed.
     Rpc(frida::Error),

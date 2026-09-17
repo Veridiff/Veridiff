@@ -20,6 +20,14 @@ the difference between correctly walking past an OLLVM dispatcher and being
 fooled by it. Each is covered below, with either a live proof or an honest
 note about what wasn't (and couldn't be) tested live.
 
+**v0.2.1** is a review pass over that release, not new features: it found
+and fixed a real correctness bug in the resync-confirmation logic v0.2.0
+had just shipped (see **Field notes** below -- it's the most serious bug
+found in this project so far, silently defeating the tuned-resync feature
+in exactly the case it exists to handle), plus a narrower argument-buffer
+aliasing issue in warm-up mode. `VeridiffError` also gained
+`#[non_exhaustive]`, which it should have had from the start.
+
 ---
 
 ## What this actually is
@@ -391,6 +399,37 @@ trusting synthetic test data.
   never dependent on the process actually running. `resume()` is the
   last line in both, purely so the spawned process doesn't get left
   stopped. If you're extending either demo, keep it that way.
+
+- **The most serious bug found in this project so far: `resync_confirmed`
+  compared a candidate resync point against *itself*, not against what
+  came after it.** `a[p..p+len]` vs `b[bj..bj+len]` starts AT the
+  candidate — and `bj` is only ever found because `b[bj] == a[p]` already
+  holds, so that leading element is a trivial self-match by construction.
+  Whenever either trace happened to end exactly at the candidate, `len`
+  collapsed to 1 and the "confirmation" checked nothing but that
+  tautology — a resync could be accepted with zero real evidence, in
+  precisely the single-block-fly-by case `MIN_CONFIRM` exists to reject
+  (see **Resync tuning** above). Concretely, `a=[...,0x30,0xD0]` (ends at
+  the shared dispatcher) against `b=[...,0x31,0xD0,0xBB,0xBC,0xBD]`
+  (three further, never-examined, genuinely different blocks) used to
+  confirm `0xD0` as a real merge. Fixed semantics: both traces ending
+  together at the candidate is legitimate and still confirms (nothing
+  left in either to disagree with — exhaustive evidence, not absent
+  evidence); one trace ending while the other continues is the bug above
+  and is now rejected. Found by an independent review pass, not by the
+  test suite that existed at the time — the tests that would have caught
+  it exist now.
+
+- **Warm-up mode's untraced pre-call shared the same allocated argument
+  buffer as the traced call that followed it.** For a `'string'`
+  argument, both calls pointed at one `Memory.allocUtf8String` buffer —
+  a target that decodes or transforms its argument in place (routine for
+  the obfuscated checks this tool exists to analyze) would have the
+  untraced warm-up call mutate the buffer the traced call then reads,
+  silently tracing over already-mutated input instead of your actual
+  argument. Fixed by giving the warm-up call its own allocation. Not
+  live-verified against a self-mutating target specifically — none was
+  built to test it, said plainly rather than implied.
 
 ---
 
