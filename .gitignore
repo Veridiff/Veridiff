@@ -11,3 +11,9 @@ venv/
 .DS_Store
 .vscode/
 .idea/
+
+# Local-only Claude Code support file. Deliberately never committed --
+# see the user's explicit instruction (repo history, if you're reading
+# this from a point before the rewrite that removed it). Any future
+# session: recreate/update it locally as needed, but never `git add` it.
+CLAUDE.md
