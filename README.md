@@ -9,24 +9,14 @@ your two runs weren't going to end the same way.
 
 That's the whole product. Not a framework. Not a platform. An engine.
 
-**v0.2.0** adds four things, in the order they were built: a reused-allocation
-pass over the trace-assembly and resync hot paths; an opt-in warm-up call
-that eliminates a real, live-reproduced false positive from dynamic-linker
-lazy binding; cross-architecture (x86 + ARM64) classification of which
-instruction in a block is the actual decision point; and a resync algorithm
-that now requires a match to hold up under continued comparison before
-trusting it, instead of accepting the first coincidental address it finds --
-the difference between correctly walking past an OLLVM dispatcher and being
-fooled by it. Each is covered below, with either a live proof or an honest
-note about what wasn't (and couldn't be) tested live.
-
-**v0.2.1** is a review pass over that release, not new features: it found
-and fixed a real correctness bug in the resync-confirmation logic v0.2.0
-had just shipped (see **Field notes** below -- it's the most serious bug
-found in this project so far, silently defeating the tuned-resync feature
-in exactly the case it exists to handle), plus a narrower argument-buffer
-aliasing issue in warm-up mode. `VeridiffError` also gained
-`#[non_exhaustive]`, which it should have had from the start.
+**Current release: v0.2.2.** Documentation restructuring, not code: this
+file now covers only the latest release, and [`CHANGELOG.md`](CHANGELOG.md)
+carries the full history back to 0.1.0 -- read that for what warm-up mode,
+ARM64 classification, and tuned resync actually are, and for the two real
+bugs a review pass found and fixed in each shortly after they shipped.
+v0.2.2 also investigated live ARM64 testing against a real rooted Android
+device; that didn't succeed end to end, and says so plainly below in
+**Field notes** rather than claiming otherwise.
 
 ---
 
@@ -293,14 +283,18 @@ distinguishes them. Mnemonic text is the only signal that does, on any
 architecture, which is what `is_conditional_branch` actually checks.
 
 Honesty about test coverage, since that empirical finding only covers what
-was on hand: the x86 half is live-verified (see above). No ARM64 hardware
-or correctly-configured emulation was available in this environment, so the
-ARM64 half (`cbz`/`cbnz`/`tbz`/`tbnz`/`b.eq`/`b.ne`/...) is verified by unit
-tests against mock disassembly payloads shaped exactly like a real
-`disassembleRange` response, not by an end-to-end live ARM64 trace. The
-underlying disassembly mechanism is Frida's own well-established multi-arch
-Capstone integration, unmodified by this change -- but say so plainly
-rather than imply hardware that wasn't touched.
+was on hand: the x86 half is live-verified (see above). The ARM64 half
+(`cbz`/`cbnz`/`tbz`/`tbnz`/`b.eq`/`b.ne`/...) is verified by unit tests
+against mock disassembly payloads shaped exactly like a real
+`disassembleRange` response, not by an end-to-end live ARM64 trace --
+real ARM64 hardware was made available in v0.2.2 specifically to close
+this gap, and the attempt is documented honestly in **Field notes**
+below: it did not succeed end to end, for reasons that turned out to be
+about Frida's injection mechanism and Android's hardening, not about this
+engine. The underlying disassembly mechanism is Frida's own
+well-established multi-arch Capstone integration, unmodified by this
+change either way -- but say so plainly rather than imply hardware that
+wasn't successfully exercised.
 
 ---
 
@@ -431,6 +425,41 @@ trusting synthetic test data.
   live-verified against a self-mutating target specifically — none was
   built to test it, said plainly rather than implied.
 
+- **Live ARM64 testing (v0.2.2) surfaced two real Frida/Android landmines
+  before the tracing pipeline ever got exercised.** Tried against a rooted
+  POCO F7 Ultra, Android 16, arm64-v8a:
+
+  1. Frida cannot inject into a statically-linked ELF binary on this
+     device. A cross-compiled, statically-linked test target (the obvious
+     first move — no NDK required, no runtime dependencies to push) failed
+     identically for both `spawn()` and `attach()`:
+     `frida.NotSupportedError: bootstrapper crashed with signal 11`.
+     Attach crashing the same way as spawn rules out spawn-gating
+     specifically — the actual cause is almost certainly that Frida's
+     injection depends on the target having a dynamic linker to `dlopen()`
+     the agent into, which a fully static binary never touches at all.
+     Not a Veridiff bug; a property of Frida's injection mechanism. Any
+     ARM64 target needs to be dynamically linked against Bionic.
+  2. `Interceptor.attach` on a function inside hardened Bionic `libc.so`
+     (tried: `strcmp`) crashed the target process — reproducibly, twice.
+     The same hook mechanism on a function inside a normal app's own
+     bundled native library (tried: Chrome Beta's `base.odex`) installed
+     and survived cleanly. That contrast is real signal: whatever's
+     happening is specific to hooking hardened system libraries, not
+     "Frida can't hook anything on this device." The likely cause is
+     ARM64 control-flow hardening (PAC/BTI/CFI) on `libc.so` in a current
+     Android build conflicting with inline hooking — a reasonable
+     hypothesis given the evidence, held to a lower confidence bar than
+     the static-binary finding above, which is confirmed.
+
+  Net result: the engine's own device-selection design needed zero
+  changes to point at the phone (Python's `VeridiffEngine(device=...)`
+  already took an arbitrary device; Rust's engine not owning a `Device`
+  meant the caller just used `DeviceType::USB` instead of local) — but no
+  end-to-end ARM64 divergence trace was produced. Said plainly rather than
+  claimed. The next attempt should start from a dynamically-linked
+  target's *own* code, per the one experiment that worked.
+
 ---
 
 ## The Law
@@ -456,11 +485,14 @@ exception:
 - New architecture support — ARM32/Thumb, MIPS, RISC-V, wherever
   Frida and Capstone already reach and our own classification logic
   (branch-type detection, and whatever comes after it) doesn't yet.
-  x86 and ARM64 are covered as of v0.2.0; ARM64 by mock-payload unit
-  tests only, since no ARM64 hardware was available to verify live --
-  a real device or correctly-configured emulator to actually run that
-  verification against is exactly the kind of contribution this
-  welcomes.
+  x86 and ARM64 are covered in `is_conditional_branch`'s classification
+  logic as of v0.2.0; ARM64 still only by mock-payload unit tests, not a
+  live trace — real hardware was tried in v0.2.2 and the tracing pipeline
+  itself didn't come up cleanly on it (see Field notes), so this is now a
+  known, investigated gap rather than an untried one. Getting a real ARM64
+  divergence trace end to end — starting from a dynamically-linked
+  target's own code, per the one experiment that did work — is exactly
+  the kind of contribution this welcomes.
 - Portability fixes for platforms the current code handles badly.
 
 **We will not merge, ever, under any framing:**
