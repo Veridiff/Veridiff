@@ -14,7 +14,7 @@
 
 [package]
 name = "veridiff"
-version = "0.2.3"
+version = "0.2.4"
 edition = "2021"
 license = "Apache-2.0"
 description = "Veridiff -- Dynamic Branch Divergence Finder (Rust engine)"

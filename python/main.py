@@ -32,7 +32,7 @@ import sys
 from dataclasses import dataclass
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple, Union
 
-__version__ = "0.2.3"
+__version__ = "0.2.4"
 
 try:
     import frida  # type: ignore
@@ -320,13 +320,27 @@ def _parse_instruction(r: Dict[str, Any]) -> Instruction:
     Rust engine's `parse_instruction` makes explicitly (see its doc
     comment) -- this function is just narrow enough that Python's normal
     indexing already gets you there for free.
+
+    The one place indexing alone doesn't get you there: `bytes.fromhex()`
+    only raises on genuinely malformed hex (odd length, non-hex chars) --
+    `bytes.fromhex("55")` decodes to a single, entirely valid byte even if
+    `size` separately claims 2. That's a different failure mode (well-formed
+    hex, wrong length) from malformed hex, and the previous version of this
+    function conflated the two, reasoning that `bytes.fromhex()` already
+    covered this case when it only covers the narrower one. Found by review,
+    matching Rust's `parse_instruction`, which got the equivalent explicit
+    `len() != size` check first -- this was the asymmetry that left behind.
     """
+    raw_bytes = bytes.fromhex(r["bytes"])
+    size = r["size"]
+    if len(raw_bytes) != size:
+        raise ValueError(f"bytes field {r['bytes']!r} decoded to {len(raw_bytes)} bytes, expected {size}")
     return Instruction(
         address=int(r["address"], 16),
         mnemonic=r["mnemonic"],
         op_str=r["opStr"],
-        size=r["size"],
-        raw_bytes=bytes.fromhex(r["bytes"]),
+        size=size,
+        raw_bytes=raw_bytes,
     )
 
 

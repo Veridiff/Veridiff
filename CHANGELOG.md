@@ -5,6 +5,37 @@ Changelog](https://keepachangelog.com/en/1.1.0/) format. Versioning
 follows [Semantic Versioning](https://semver.org/); pre-1.0, a minor bump
 may include breaking changes, per semver's own pre-1.0 carve-out.
 
+## [0.2.4] - 2026-09-17
+
+### Fixed
+- `_parse_instruction` (Python) had the same silent-truncation gap the
+  0.2.3 Rust fix closed, missed at the time: `bytes.fromhex()` only raises
+  on genuinely malformed hex (odd length, non-hex characters), not on
+  well-formed hex that simply disagrees with a separately-reported `size`
+  field (`bytes.fromhex("55")` decodes to one valid byte regardless of
+  what `size` claims). The 0.2.3 commit message reasoned that Python's
+  stdlib already covered this and only fixed Rust; that reasoning covered
+  the malformed-hex case but not the wrong-length-well-formed-hex case,
+  which is the one the explicit check actually exists for. Found by the
+  automated review pass that same commit didn't wait for. Both languages
+  now cross-check decoded length against `size` identically.
+- `disassemble_block` (Rust) returned `VeridiffError::IncompleteTrace` for
+  a `disassembleRange` response that wasn't a JSON array -- a real
+  failure, but the wrong variant. `IncompleteTrace`'s own doc comment
+  defines it as specifically `trace_call`'s channel-closed-or-timed-out
+  case; a malformed RPC response is the unrelated failure mode
+  `MalformedResponse` exists for, introduced in the same 0.2.3 commit for
+  exactly this kind of case one function away. A caller distinguishing
+  "transient, maybe retry" from "permanent, don't retry" by matching on
+  the variant would have gotten the wrong signal.
+- Added a test that was missing for both of the above: the existing 0.2.3
+  regression test only covered *malformed* hex ("555", odd length), which
+  would keep passing even if the explicit length check were deleted and
+  hex-decoding's own error behavior were relied on instead -- masking a
+  regression back to the original silent-truncation bug. New tests in both
+  languages use well-formed hex that's simply the wrong length ("55" vs a
+  declared `size` of 2), which only the explicit check catches.
+
 ## [0.2.3] - 2026-09-17
 
 ### Fixed

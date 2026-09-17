@@ -673,10 +673,22 @@ impl VeridiffEngine {
             )
             .map_err(VeridiffError::Rpc)?;
 
-        let items = result
-            .as_ref()
-            .and_then(Value::as_array)
-            .ok_or(VeridiffError::IncompleteTrace)?;
+        // MalformedResponse, not IncompleteTrace -- found by review.
+        // IncompleteTrace's own doc comment defines it as specifically "the
+        // message channel closed, or timed out, before a done event
+        // arrived" (trace_call's failure mode). A disassembleRange response
+        // that isn't a JSON array is a different, unrelated problem -- the
+        // same "agent response doesn't have the shape we expected" case
+        // MalformedResponse exists for, one call below in parse_instruction.
+        // Reusing IncompleteTrace here would give a caller that pattern-
+        // matches on VeridiffError to decide "is this worth retrying" the
+        // wrong signal: a timeout may be transient, a malformed response
+        // to a well-formed request never is.
+        let items = result.as_ref().and_then(Value::as_array).ok_or_else(|| {
+            VeridiffError::MalformedResponse(format!(
+                "disassembleRange did not return a JSON array: {result:?}"
+            ))
+        })?;
 
         items.iter().map(parse_instruction).collect()
     }
@@ -1363,6 +1375,27 @@ mod tests {
         // 1-byte raw_bytes for a declared size of 2.
         let item = serde_json::json!({
             "address": "0x401146", "mnemonic": "push", "opStr": "rbp", "size": 2, "bytes": "555",
+        });
+        match parse_instruction(&item) {
+            Err(VeridiffError::MalformedResponse(_)) => {}
+            other => panic!("expected MalformedResponse, got {other:?}"),
+        }
+    }
+
+    /// Companion to the test above, isolating what it didn't actually
+    /// cover: found by review. "555" (odd length) is malformed hex, so it
+    /// would still error even if the explicit `raw_bytes.len() != size`
+    /// check were deleted and hex-decoding were relied on alone -- that
+    /// test alone wouldn't catch a regression back to the original bug.
+    /// This uses well-formed hex ("55", one valid byte) that simply
+    /// disagrees with a separately-declared `size` of 2 -- the actual
+    /// shape of the bug the check exists to catch, and the only shape
+    /// that distinguishes "the explicit check is doing real work" from
+    /// "hex-decoding happens to error for an unrelated reason."
+    #[test]
+    fn well_formed_bytes_field_disagreeing_with_size_is_also_an_error() {
+        let item = serde_json::json!({
+            "address": "0x401146", "mnemonic": "push", "opStr": "rbp", "size": 2, "bytes": "55",
         });
         match parse_instruction(&item) {
             Err(VeridiffError::MalformedResponse(_)) => {}

@@ -9,12 +9,12 @@ your two runs weren't going to end the same way.
 
 That's the whole product. Not a framework. Not a platform. An engine.
 
-**Current release: v0.2.3.** ARM64 is now live-verified end to end, on
-real hardware, in both engines -- see **Proof, Not Promises** below. The
-same `examples/licensecheck.c` used for the x86 proof needed zero changes
-to prove it: one source, two architectures. [`CHANGELOG.md`](CHANGELOG.md)
-carries the full history back to 0.1.0, including what it took to get
-here and two more latent bugs a review pass found in the process.
+**Current release: v0.2.4.** ARM64 is live-verified end to end, on real
+hardware, in both engines -- see **Proof, Not Promises** below. v0.2.4
+itself is a small follow-up: the automated review pass v0.2.3 shipped
+without waiting for found a real asymmetry (Python was missing a length
+check Rust had just gained) plus a misleading error variant, both fixed.
+[`CHANGELOG.md`](CHANGELOG.md) carries the full history back to 0.1.0.
 
 ---
 

@@ -313,3 +313,16 @@ def test_well_formed_disassembly_item_still_parses_normally():
     assert insn.op_str == "rbp"
     assert insn.size == 1
     assert insn.raw_bytes == b"\x55"
+
+
+def test_well_formed_bytes_field_disagreeing_with_size_is_an_error():
+    # Found by review: bytes.fromhex() only raises on genuinely malformed
+    # hex (odd length, non-hex chars) -- bytes.fromhex("55") decodes to one
+    # entirely valid byte regardless of what `size` separately claims, so
+    # relying on bytes.fromhex() alone (as this function used to) misses
+    # exactly this shape of bug. "55" is well-formed hex; disagreeing with
+    # size=2 is the only thing wrong with it, which is the actual case the
+    # explicit length check exists to catch.
+    item = {"address": "0x401146", "mnemonic": "push", "opStr": "rbp", "size": 2, "bytes": "55"}
+    with pytest.raises(ValueError):
+        veridiff._parse_instruction(item)
