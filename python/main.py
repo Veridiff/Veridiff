@@ -121,7 +121,7 @@ rpc.exports = {
         //
         // Uses its OWN allocArg() pass -- args.map(allocArg) again, not the
         // nativeArgs built below -- deliberately, not redundantly. Found by
-        // an independent review pass: a 'string' arg is a pointer to one
+        // a later review: a 'string' arg is a pointer to one
         // Memory.allocUtf8String buffer; reusing that same allocation for
         // both calls means a target that decodes/transforms its argument
         // in place (routine for the obfuscated checks this tool targets)
@@ -675,7 +675,7 @@ class VeridiffEngine:
         it: up to `_MIN_CONFIRM` blocks strictly beyond the candidate in
         both traces, required to agree.
 
-        Found by an independent review pass (2026-09-17), not by any test:
+        Found by a later review (2026-09-17), not by any test:
         the original version of this function compared a[p:p+length] against
         b[bj:bj+length] -- starting AT the candidate, not after it. Since bj
         is only ever looked up because b[bj] == a[p] already, that leading
@@ -746,7 +746,7 @@ class VeridiffEngine:
         window (a dispatcher hit on every loop iteration, say) triggers an
         O(resync_window) fallback re-scan on every one of up to
         resync_window outer candidates before the outer search gives up on
-        that region. Flagged by an independent review pass, not hit in
+        that region. Flagged by a later review, not hit in
         practice against any real or synthetic case run through this engine
         so far -- accepted rather than fixed with an explicit comparison
         budget, since `resync_window` already bounds the pathological case

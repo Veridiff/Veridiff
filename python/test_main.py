@@ -159,7 +159,7 @@ def test_later_occurrence_of_a_repeated_value_can_still_confirm():
 
 def test_resync_is_rejected_when_only_one_trace_is_exhausted_at_the_candidate():
     # Regression test for the _resync_confirmed bug found in the
-    # 2026-09-17 review pass (see its docstring for the full explanation).
+    # 2026-09-17 review (see its docstring for the full explanation).
     # Trace A ends exactly at the shared dispatcher 0xD0; trace B has three
     # further, genuinely different blocks after it that were never
     # examined. Must NOT confirm -- before the fix, this exact shape
@@ -423,7 +423,7 @@ def test_mock_arm64_disassembly_payload_flags_the_decisive_instruction():
 
 
 # --------------------------------------------------------------------------
-# Review pass (2026-09-17): failure-path coverage for _parse_instruction.
+# Review (2026-09-17): failure-path coverage for _parse_instruction.
 #
 # Found by re-reading the code, not by any test or live run turning up
 # wrong behavior -- both ends of this protocol are this repo's own agent,

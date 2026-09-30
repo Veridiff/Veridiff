@@ -11,9 +11,3 @@ venv/
 .DS_Store
 .vscode/
 .idea/
-
-# Local-only Claude Code support file. Deliberately never committed, and as
-# of 2026-09-30 deliberately not present in this directory at all -- its
-# content lives outside the repo. Kept here as a safety net so that a future
-# session recreating it by habit still can't commit it.
-CLAUDE.md

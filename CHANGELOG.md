@@ -18,9 +18,8 @@ may include breaking changes, per semver's own pre-1.0 carve-out.
   does not stop instrumented execution instantly, so those outer frames kept
   emitting block events, delivered *after* `traceCall` returned -- into the
   next call's message stream, where the host prepended them to an unrelated
-  trace. Measured on `depth(2)` of a four-line recursive function traced
-  twice with the same argument: 9 then 11 blocks, divergence reported at
-  index 0. Fixed by tracking call depth in the agent (follow on the
+  trace. Measured on `examples/depth.c` calling `depth(2)` twice with the
+  same argument: 9 then 11 blocks, divergence reported at index 0. Fixed by tracking call depth in the agent (follow on the
   outermost entry only, stop on the outermost return only) and by stamping
   every agent message with the id of the `traceCall` that produced it, so
   late events are discarded rather than absorbed by the next listener.
@@ -31,9 +30,9 @@ may include breaking changes, per semver's own pre-1.0 carve-out.
   `trace_call` indefinitely.** `Interceptor` hooks are process-wide, not
   per-thread: another thread entering the target ran `Stalker.follow()` for
   *our* thread id from *its* callback, and its `onLeave` stopped stalking
-  mid-measurement. Reproduced with a target whose background thread calls
-  the traced function in a loop -- the first `trace_call` never returned
-  (killed at 75s). Fixed by gating both callbacks on the thread id; the same
+  mid-measurement. Reproduced with `examples/mt.c`, whose background thread
+  calls the traced function in a loop -- the first `trace_call` never
+  returned (killed at 75s). Fixed by gating both callbacks on the thread id; the same
   target now returns three identical 9-block traces. *Live-verified by the
   symptom disappearing; the precise mechanism of the hang itself was never
   established.*
@@ -61,6 +60,14 @@ may include breaking changes, per semver's own pre-1.0 carve-out.
   empty if and only if `find_first_divergence` returns `None`, and the first
   region's fields agree with the divergence point's. *Verified by unit test;
   this is the test that would have caught the gap.*
+
+### Added
+- `examples/depth.c` and `examples/mt.c`: the two targets the fixes above
+  were found and verified against -- a minimal recursive function and one
+  whose background thread calls the traced function in a loop. Committed
+  for the same reason `licensecheck.c` is: every claim in this release is
+  reproducible from sources in this repository, with the exact build flags
+  and resulting symbol addresses in each file's header comment.
 
 ### Changed
 - **Breaking (Rust):** `DivergenceRegion::branch_a`/`branch_b` are now
@@ -103,7 +110,7 @@ may include breaking changes, per semver's own pre-1.0 carve-out.
   stdlib already covered this and only fixed Rust; that reasoning covered
   the malformed-hex case but not the wrong-length-well-formed-hex case,
   which is the one the explicit check actually exists for. Found by the
-  automated review pass that same commit didn't wait for. Both languages
+  review that same commit didn't wait for. Both languages
   now cross-check decoded length against `size` identically.
 - `disassemble_block` (Rust) returned `VeridiffError::IncompleteTrace` for
   a `disassembleRange` response that wasn't a JSON array -- a real
@@ -131,7 +138,7 @@ may include breaking changes, per semver's own pre-1.0 carve-out.
   as a shorter-than-expected `raw_bytes` rather than the loud
   `MalformedResponse` every other field in that function already gets.
   Fixed by cross-checking the decoded length against the agent-reported
-  `size`. Found in the same review pass that added `MalformedResponse`
+  `size`. Found in the same review that added `MalformedResponse`
   itself, for consistency -- never observed to actually happen. Python's
   `bytes.fromhex()` already raised `ValueError` on the same malformed
   input, so only the Rust side needed this.
@@ -145,9 +152,9 @@ may include breaking changes, per semver's own pre-1.0 carve-out.
   and traced over `adb`/USB. `b.ne` (ARM64's conditional branch, where x86
   uses `jne`) correctly identified as the deciding instruction by the same
   `is_conditional_branch` classifier introduced in 0.2.0 as mock-tested
-  only. Full reproducible recipe in `CLAUDE.md`'s Testing section.
-  Getting here took two failed attempts, both documented (README Field
-  Notes, `CLAUDE.md`): Frida cannot inject into a statically-linked ELF
+  only. Full reproducible recipe in the README's field notes.
+  Getting here took two failed attempts, both documented there: Frida
+  cannot inject into a statically-linked ELF
   binary (fixed by building with the NDK, dynamically linked, instead),
   and hooking a function inside hardened Bionic `libc.so` crashes the
   target process while hooking a normal app's own native library doesn't
@@ -155,7 +162,7 @@ may include breaking changes, per semver's own pre-1.0 carve-out.
   library function). Neither was a Veridiff bug.
 
 ### Changed
-- README and `CLAUDE.md`'s ARM64 sections rewritten throughout to reflect
+- The README's ARM64 sections rewritten throughout to reflect
   the successful result -- the "not yet successful end to end" framing
   from 0.2.2 is gone; the two real technical findings that framing was
   protecting are kept, since they're still true and still useful to
@@ -164,8 +171,9 @@ may include breaking changes, per semver's own pre-1.0 carve-out.
 ## [0.2.2] - 2026-09-17
 
 ### Added
-- `CLAUDE.md`: durable, repo-committed project instructions (versioning
-  policy, commit policy, testing policy, scope pointer to "The Law").
+- Written-down maintenance policy for this project (versioning, commits,
+  testing, and a scope pointer to "The Law"), kept as maintainer notes
+  outside the repository rather than shipped in it.
 - `CHANGELOG.md` (this file), backfilled to 0.1.0.
 
 ### Changed
@@ -194,7 +202,7 @@ may include breaking changes, per semver's own pre-1.0 carve-out.
     Python's `VeridiffEngine(device=...)` already accepted an arbitrary
     Frida device, and Rust's engine not owning a `Device` meant the same
     USB-vs-local switch needed zero engine code changes on either side.
-  - See `CLAUDE.md`'s Testing section and README Field Notes for the full
+  - See the README's field notes for the full
     writeup and what the next attempt should try differently.
 
 ## [0.2.1] - 2026-09-17
@@ -214,7 +222,7 @@ may include breaking changes, per semver's own pre-1.0 carve-out.
   exhausted together at the candidate is legitimate and still confirms
   (nothing left in either to disagree with); one exhausted while the
   other continues is rejected (the bug above). Found by an independent
-  review pass, not by the test suite that existed at the time.
+  review, not by the test suite that existed at the time.
 - Warm-up mode's untraced pre-call shared the same allocated argument
   buffer as the traced call that followed it. For a `'string'` argument,
   both calls pointed at one allocation -- a target that decodes or

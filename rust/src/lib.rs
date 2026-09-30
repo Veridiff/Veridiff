@@ -107,7 +107,7 @@ rpc.exports = {
         //
         // Uses its OWN allocArg() pass -- args.map(allocArg) again, not the
         // nativeArgs built below -- deliberately, not redundantly. Found by
-        // an independent review pass: a 'string' arg is a pointer to one
+        // a later review: a 'string' arg is a pointer to one
         // Memory.allocUtf8String buffer; reusing that same allocation for
         // both calls means a target that decodes/transforms its argument
         // in place (routine for the obfuscated checks this tool targets)
@@ -854,7 +854,7 @@ impl VeridiffEngine {
     /// window (a dispatcher hit on every loop iteration, say) triggers an
     /// O(resync_window) fallback re-scan on every one of up to
     /// resync_window outer candidates before the outer search gives up on
-    /// that region. Flagged by an independent review pass, not hit in
+    /// that region. Flagged by a later review, not hit in
     /// practice against any real or synthetic case run through this engine
     /// so far -- accepted rather than fixed with an explicit comparison
     /// budget, since `resync_window` already bounds the pathological case
@@ -988,7 +988,7 @@ impl VeridiffEngine {
     /// it: up to `MIN_CONFIRM` blocks strictly beyond the candidate in both
     /// traces, required to agree.
     ///
-    /// Found by an independent review pass (2026-09-17), not by any test:
+    /// Found by a later review (2026-09-17), not by any test:
     /// the original version of this function compared `a[p..p+len]` against
     /// `b[bj..bj+len]` -- starting AT the candidate, not after it. Since
     /// `bj` is only ever looked up because `b[bj] == a[p]` already, that
@@ -1075,7 +1075,7 @@ fn parse_instruction(item: &Value) -> Result<Instruction, VeridiffError> {
     // other field here gets. Checking the decoded length against `size`
     // (which the agent always sets to the true byte count) catches that
     // silently, the same "fail loud on our own protocol" standard as the
-    // rest of this function -- found in the same review pass as the
+    // rest of this function -- found in the same review as the
     // MalformedResponse variant itself, for consistency, not because it
     // was ever observed to actually happen.
     let raw_bytes = hex_decode(bytes_hex);
@@ -1243,7 +1243,7 @@ mod tests {
     }
 
     /// Regression test for the resync_confirmed bug found in the
-    /// 2026-09-17 review pass (see its doc comment for the full
+    /// 2026-09-17 review (see its doc comment for the full
     /// explanation). Trace A ends exactly at the shared dispatcher 0xD0;
     /// trace B has three further, genuinely different blocks after it that
     /// were never examined. Must NOT confirm -- before the fix, this
@@ -1612,7 +1612,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // Review pass (2026-09-17): failure-path coverage for the two fixes
+    // Review (2026-09-17): failure-path coverage for the two fixes
     // below, both found by re-reading the code rather than by any test or
     // live run turning up wrong behavior. Neither was manifesting in
     // practice -- both sides of this protocol are this crate's own code,

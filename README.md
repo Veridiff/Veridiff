@@ -171,8 +171,7 @@ made. Those changes key off thread ids and call depth, with no
 instruction-level assumptions, and the x86 half of this proof reproduces
 byte-for-byte on v0.3.0 — but `check_license` is neither recursive nor
 called from a second thread, so "v0.3.0 would print the same thing here"
-is reasoning from the x86 result, not a measurement on the phone. Stated
-rather than quietly left for you to assume.
+is reasoning from the x86 result, not a measurement on the phone.
 
 ---
 
@@ -471,7 +470,7 @@ trusting synthetic test data.
   together at the candidate is legitimate and still confirms (nothing
   left in either to disagree with — exhaustive evidence, not absent
   evidence); one trace ending while the other continues is the bug above
-  and is now rejected. Found by an independent review pass, not by the
+  and is now rejected. Found by a later review, not by the
   test suite that existed at the time — the tests that would have caught
   it exist now. This held the title of most serious bug in the project's
   history through v0.2.4; the re-entrancy bug below, found in v0.3.0, is
@@ -501,13 +500,12 @@ trusting synthetic test data.
   silently tracing over already-mutated input instead of your actual
   argument. Fixed by giving the warm-up call its own allocation. Not
   live-verified against a self-mutating target specifically — none was
-  built to test it, said plainly rather than implied.
+  built to test it.
 
 - **Tracing a re-entrant (recursive) target used to produce a false
-  divergence between two *identical* calls — the worst bug this project has
-  had, because it broke the headline function rather than a heuristic above
-  it.** Two mechanisms, one root cause, both found by tracing a four-line
-  recursive C function rather than by any test:
+  divergence between two *identical* calls.** Two mechanisms, one root
+  cause, both found by tracing a recursive function rather than by any
+  test:
 
   1. `Interceptor.attach`'s `onLeave` fires **innermost-first**. Stopping
      Stalker there cut tracing off while the outer frames were still
@@ -518,12 +516,12 @@ trusting synthetic test data.
      `traceCall` had returned, i.e. into the **next** call's message stream,
      where the host prepended them to an unrelated trace.
 
-  Measured, on `depth(2)` of a plain `int depth(int n) { return n <= 0 ? 0 :
-  1 + depth(n-1); }`, traced twice with the same argument: 9 blocks then 11
-  blocks, `find_first_divergence` reporting a divergence at **index 0**. For
-  a tool whose entire promise is "the traces differ here", silently
-  inventing a difference between two identical runs is as bad as it gets.
-  Fixed by tracking call depth in the agent — follow on the outermost entry
+  Measured on [`examples/depth.c`](examples/depth.c) — six lines, recursion
+  and nothing else — calling `depth(2)` twice with the same argument: 9
+  blocks, then 11 blocks, `find_first_divergence` reporting a divergence at
+  **index 0**. For a tool whose entire promise is "the traces differ here",
+  silently inventing a difference between two identical runs is as bad as it
+  gets. Fixed by tracking call depth in the agent — follow on the outermost entry
   only, stop on the outermost return only — and by stamping every message
   with the id of the `traceCall` that produced it, so late events are
   discarded by construction instead of being absorbed by whoever is
@@ -536,13 +534,14 @@ trusting synthetic test data.
   `trace_call` forever.** `Interceptor` hooks are process-wide, not
   per-thread: another thread entering the target ran `Stalker.follow()` for
   *our* thread id from *its* callback, and its `onLeave` stopped stalking in
-  the middle of the call actually being measured. Reproduced with a target
-  whose background thread calls the traced function in a loop — the very
-  first `trace_call` never returned (killed at 75s). Fixed by gating both
-  callbacks on `this.threadId !== tid`; the same target now returns three
-  identical 9-block traces. Honest limit: the fix is verified by the
-  symptom disappearing, and the precise mechanism of the *hang* (as opposed
-  to the obvious trace corruption) was never established.
+  the middle of the call actually being measured. Reproduced with
+  [`examples/mt.c`](examples/mt.c), whose background thread calls the traced
+  function in a loop: the very first `trace_call` never returned, and was
+  killed at 75 seconds. Fixed by gating both callbacks on
+  `this.threadId !== tid`; the same target now returns three identical
+  9-block traces. Honest limit: the fix is verified by the symptom
+  disappearing, and the precise mechanism of the *hang* — as opposed to the
+  obvious trace corruption — was never established.
 
 - **`close()` hangs if the spawned process was never resumed.** Observed
   twice out of two attempts while building the recursion test above:
