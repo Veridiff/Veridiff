@@ -5,6 +5,92 @@ Changelog](https://keepachangelog.com/en/1.1.0/) format. Versioning
 follows [Semantic Versioning](https://semver.org/); pre-1.0, a minor bump
 may include breaking changes, per semver's own pre-1.0 carve-out.
 
+## [0.3.0] - 2026-10-01
+
+### Fixed
+- **A re-entrant (recursive) target produced a false divergence between two
+  identical calls.** The worst bug in this project's history: unlike the
+  0.2.1 `resync_confirmed` bug, which broke the resync heuristic, this one
+  broke `find_first_divergence` -- the headline function. Two mechanisms,
+  one root cause. (a) `Interceptor`'s `onLeave` fires innermost-first, so
+  stopping Stalker there cut tracing off while the outer frames were still
+  running, losing every outer frame's unwind block. (b) `Stalker.unfollow()`
+  does not stop instrumented execution instantly, so those outer frames kept
+  emitting block events, delivered *after* `traceCall` returned -- into the
+  next call's message stream, where the host prepended them to an unrelated
+  trace. Measured on `depth(2)` of a four-line recursive function traced
+  twice with the same argument: 9 then 11 blocks, divergence reported at
+  index 0. Fixed by tracking call depth in the agent (follow on the
+  outermost entry only, stop on the outermost return only) and by stamping
+  every agent message with the id of the `traceCall` that produced it, so
+  late events are discarded rather than absorbed by the next listener.
+  *Live-verified on x86 in both engines*: identical 11-block traces for
+  `depth(2)`, `None` from the diff, and the full block sequence matching one
+  derived by hand from `objdump` including the unwind blocks.
+- **Tracing a function another thread was calling concurrently hung
+  `trace_call` indefinitely.** `Interceptor` hooks are process-wide, not
+  per-thread: another thread entering the target ran `Stalker.follow()` for
+  *our* thread id from *its* callback, and its `onLeave` stopped stalking
+  mid-measurement. Reproduced with a target whose background thread calls
+  the traced function in a loop -- the first `trace_call` never returned
+  (killed at 75s). Fixed by gating both callbacks on the thread id; the same
+  target now returns three identical 9-block traces. *Live-verified by the
+  symptom disappearing; the precise mechanism of the hang itself was never
+  established.*
+- **The 0.2.1 `resync_confirmed` fix was incomplete.** It special-cased only
+  *zero* blocks remaining after the candidate, while the general
+  `min(MIN_CONFIRM, a_remaining, b_remaining)` window still shrank below
+  `MIN_CONFIRM` whenever either trace had one or two blocks left -- so
+  `a=[...,0x30,0xD0,0xAA]` against `b=[...,0x31,0xD0,0xAA,0xBB,0xBC,0xBD]`
+  confirmed `0xD0` on a single matching block while B's three remaining,
+  genuinely different blocks went unexamined. The same shape as the original
+  bug, one block further along, found the same way: by re-reading the fix
+  against the docstring stating what it was supposed to guarantee. The rule
+  now states the intent rather than enumerating cases -- a short
+  confirmation window is acceptable only when it is short *because both
+  traces ran out together*, and then every remaining block must match.
+  *Verified by unit test in both engines.*
+- **`find_divergence_regions` silently dropped a trailing length
+  difference.** When one trace ran out while the other kept going -- either
+  at the start (one a strict prefix of the other) or in the tail after an
+  accepted resync -- it just stopped and reported nothing, so an empty
+  result meant either "identical" or "differs only in length", while
+  `find_first_divergence` correctly reported the difference. It is now
+  reported as a final region with the exhausted side's branch set to
+  `None`. New invariant, now unit-tested in both engines: the region list is
+  empty if and only if `find_first_divergence` returns `None`, and the first
+  region's fields agree with the divergence point's. *Verified by unit test;
+  this is the test that would have caught the gap.*
+
+### Changed
+- **Breaking (Rust):** `DivergenceRegion::branch_a`/`branch_b` are now
+  `Option<u64>` rather than `u64`, which is what lets the trailing-difference
+  case above be represented at all. Python's annotations became
+  `Optional[int]` to match, though nothing there enforced the old ones.
+- **Breaking (protocol):** the agent's `traceCall` takes a trailing `callId`
+  and echoes it on every message it sends. A host and an `AGENT_SOURCE` from
+  different versions must not be mixed; within a release they always match,
+  since each engine embeds its own copy.
+- `collect_trace` extracted from Rust's `trace_call` as a standalone function
+  over the event channel, so stale-event rejection is testable without Frida
+  or a live target -- otherwise it is only reachable by racing a real
+  re-entrant process.
+- README: the ARM64 build recipe is now inline rather than referenced from a
+  file that is not part of this repository; `find_divergence_regions`'
+  complexity note in "How it works" now matches the docstring's honest
+  worst case.
+
+### Known issues
+- `close()` hangs if the spawned process was never resumed (observed twice
+  out of two; `resume()` then `close()` always worked). Not investigated, not
+  fixed. Both demos resume before exiting, so neither exhibits it. See README
+  field notes.
+- The agent changes are live-verified on **x86 only**. The ARM64 proof in the
+  README was produced by the v0.2.3 agent; no ARM64 device was connected for
+  this release. The change is architecture-independent (thread ids and call
+  depth, no instruction-level assumptions), but that is reasoning, not a
+  measurement.
+
 ## [0.2.4] - 2026-09-17
 
 ### Fixed

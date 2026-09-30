@@ -62,7 +62,7 @@ function nativeArgType(spec) {
 }
 
 rpc.exports = {
-    traceCall(targetHex, args, retType, moduleName, warmUp) {
+    traceCall(targetHex, args, retType, moduleName, warmUp, callId) {
         const target = ptr(targetHex);
         const mod = moduleName
             ? Process.getModuleByName(moduleName)
@@ -71,8 +71,19 @@ rpc.exports = {
             throw new Error('no module contains address ' + targetHex + '; pass moduleName explicitly');
         }
 
+        // Every message this call emits is stamped with `callId`, and the host
+        // drops anything carrying a different one. Stalker.unfollow() does not
+        // stop instrumented execution instantly: a thread already inside
+        // generated code keeps running it, and those events can be delivered
+        // AFTER traceCall has returned -- landing in the NEXT call's message
+        // stream, where the host would otherwise prepend them to an unrelated
+        // trace. Found live: two identical calls to a recursive function
+        // reported a divergence at index 0 purely from the previous call's
+        // late blocks. The onReceive closure below captures this callId, so
+        // stale chunks carry the old value and are discarded by construction.
         send({
             type: 'meta',
+            callId,
             pointerSize: Process.pointerSize,
             moduleName: mod.name,
             moduleBase: mod.base.toString(),
@@ -115,6 +126,7 @@ rpc.exports = {
         const tid = Process.getCurrentThreadId();
 
         let blockCount = 0;
+        let depth = 0;
         let stalkerCleanedUp = false;
         const stopStalking = () => {
             if (stalkerCleanedUp) return; // onLeave and the finally block both call this
@@ -133,17 +145,36 @@ rpc.exports = {
         // Stalker just never engages unless bracketed this way). So a
         // throwaway Interceptor hook on the target itself is used purely to
         // get Stalker engaged for the one call we're about to make.
+        //
+        // Both callbacks are gated twice, and both gates fix bugs found by
+        // tracing a real process:
+        //
+        // 1. `this.threadId !== tid`: Interceptor hooks are process-wide, not
+        //    per-thread. Any other thread calling this same function while we
+        //    trace would otherwise run Stalker.follow() for OUR thread id from
+        //    ITS callback, and its onLeave would stop stalking in the middle of
+        //    the call actually being measured.
+        // 2. `depth`: for a recursive (or otherwise re-entrant) target, onLeave
+        //    fires innermost-first. Unconditionally stopping there cut tracing
+        //    off while the outer frames were still running -- the trace lost
+        //    every outer frame's unwind blocks, and those blocks then leaked
+        //    into the next call (see the callId comment above). Follow on the
+        //    outermost entry only, stop on the outermost return only.
         const listener = Interceptor.attach(target, {
             onEnter() {
+                if (this.threadId !== tid) return;
+                if (depth++ > 0) return;
                 Stalker.follow(tid, {
                     events: { block: true },
                     onReceive(buffer) {
                         blockCount += buffer.byteLength / (4 * Process.pointerSize);
-                        send({ type: 'chunk' }, buffer);
+                        send({ type: 'chunk', callId }, buffer);
                     },
                 });
             },
             onLeave() {
+                if (this.threadId !== tid) return;
+                if (--depth > 0) return;
                 stopStalking();
             },
         });
@@ -152,6 +183,7 @@ rpc.exports = {
             const returnValue = fn(...nativeArgs);
             send({
                 type: 'done',
+                callId,
                 blockCount,
                 returnValue: retType === 'void' ? null : returnValue.toString(),
             });
@@ -361,8 +393,15 @@ pub struct DivergencePoint {
 pub struct DivergenceRegion {
     pub common_index: isize,
     pub last_common_block: Option<u64>,
-    pub branch_a: u64,
-    pub branch_b: u64,
+    /// The first differing block on A's side, or `None` when trace A simply ran
+    /// out while B kept going -- a real difference with no block to name on the
+    /// exhausted side. Became `Option` in 0.3.0 (a breaking change for
+    /// exhaustive field access) so that case can be reported at all; see
+    /// `find_divergence_regions`.
+    pub branch_a: Option<u64>,
+    /// The first differing block on B's side, or `None` when trace B ran out.
+    /// See `branch_a`.
+    pub branch_b: Option<u64>,
     pub resync_index_a: Option<usize>,
     pub resync_index_b: Option<usize>,
     pub resync_block: Option<u64>,
@@ -415,16 +454,25 @@ impl std::error::Error for VeridiffError {}
 // Agent message plumbing.
 // --------------------------------------------------------------------------
 
+/// One message from the agent. Every trace-carrying variant is stamped with the
+/// `call_id` of the `traceCall` that produced it, because events can arrive
+/// after that call already returned -- see the `callId` comment in
+/// `AGENT_SOURCE` and `collect_trace`.
 #[derive(Debug)]
 enum AgentEvent {
     Meta {
+        call_id: u64,
         pointer_size: usize,
         module_name: String,
         module_base: u64,
         module_size: u64,
     },
-    Chunk(Vec<u8>),
+    Chunk {
+        call_id: u64,
+        data: Vec<u8>,
+    },
     Done {
+        call_id: u64,
         return_value: Option<String>,
     },
     Log(String),
@@ -463,6 +511,7 @@ impl ScriptHandler for RelayHandler {
                         let payload = &m.payload;
                         let parsed = (|| {
                             Some(AgentEvent::Meta {
+                                call_id: payload["callId"].as_u64()?,
                                 pointer_size: payload["pointerSize"].as_u64()? as usize,
                                 module_name: payload["moduleName"].as_str()?.to_string(),
                                 module_base: u64::from_str_radix(
@@ -480,14 +529,31 @@ impl ScriptHandler for RelayHandler {
                             )),
                         }
                     }
-                    "chunk" => AgentEvent::Chunk(data.unwrap_or_default()),
-                    "done" => AgentEvent::Done {
-                        return_value: m
-                            .payload
-                            .get("returnValue")
-                            .and_then(Value::as_str)
-                            .map(String::from),
-                    },
+                    // A chunk or done without a usable callId can't be matched
+                    // to the call it belongs to, and guessing would risk
+                    // splicing a stale trace into a live one -- the exact bug
+                    // callId exists to prevent. Surfaced as a log instead.
+                    "chunk" | "done" => {
+                        let Some(call_id) = m.payload.get("callId").and_then(Value::as_u64) else {
+                            let _ = self.tx.send(AgentEvent::Log(format!(
+                                "'{kind}' message without a usable callId, ignoring: {}",
+                                m.payload
+                            )));
+                            return;
+                        };
+                        if kind == "chunk" {
+                            AgentEvent::Chunk { call_id, data: data.unwrap_or_default() }
+                        } else {
+                            AgentEvent::Done {
+                                call_id,
+                                return_value: m
+                                    .payload
+                                    .get("returnValue")
+                                    .and_then(Value::as_str)
+                                    .map(String::from),
+                            }
+                        }
+                    }
                     _ => return,
                 };
                 let _ = self.tx.send(event);
@@ -520,14 +586,14 @@ struct TraceBuilder {
 impl TraceBuilder {
     fn absorb(&mut self, event: AgentEvent) {
         match event {
-            AgentEvent::Meta { pointer_size, module_name, module_base, module_size } => {
+            AgentEvent::Meta { pointer_size, module_name, module_base, module_size, .. } => {
                 self.pointer_size = pointer_size;
                 self.module_name = module_name;
                 self.module_base = module_base;
                 self.module_size = module_size;
                 self.got_meta = true;
             }
-            AgentEvent::Chunk(buf) => {
+            AgentEvent::Chunk { data: buf, .. } => {
                 if !self.got_meta {
                     return; // meta always precedes chunks; ignore stray data otherwise
                 }
@@ -574,6 +640,38 @@ impl TraceBuilder {
 
 const RECV_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Drains `rx` until this call's `done` arrives, building the trace from the
+/// events that belong to `call_id` and discarding the ones that don't.
+///
+/// Split out of `trace_call` so it can be tested without Frida or a live
+/// target: stale-event rejection is otherwise only reachable by racing a real
+/// re-entrant process. Events from an earlier call can genuinely still be in
+/// flight here, because `Stalker.unfollow()` doesn't stop instrumented
+/// execution instantly (see the `callId` comment in `AGENT_SOURCE`) -- absorbing
+/// them would splice a previous call's blocks into this trace, live-observed as
+/// a divergence at index 0 between two identical calls to a recursive target.
+fn collect_trace(rx: &Receiver<AgentEvent>, call_id: u64) -> Result<Trace, VeridiffError> {
+    let mut builder = TraceBuilder::default();
+    loop {
+        match rx.recv_timeout(RECV_TIMEOUT) {
+            Ok(AgentEvent::Done { call_id: id, return_value }) if id == call_id => {
+                return Ok(builder.into_trace(return_value))
+            }
+            Ok(AgentEvent::Log(l)) => eprintln!("[veridiff-agent] {l}"),
+            Ok(AgentEvent::Meta { call_id: id, .. }) | Ok(AgentEvent::Chunk { call_id: id, .. })
+            | Ok(AgentEvent::Done { call_id: id, .. })
+                if id != call_id =>
+            {
+                // A leftover from an earlier call that has already returned.
+                // Dropped silently: for a re-entrant target this is expected
+                // traffic, not an anomaly.
+            }
+            Ok(event) => builder.absorb(event),
+            Err(_) => return Err(VeridiffError::IncompleteTrace),
+        }
+    }
+}
+
 // --------------------------------------------------------------------------
 // The engine.
 // --------------------------------------------------------------------------
@@ -589,6 +687,12 @@ const RECV_TIMEOUT: Duration = Duration::from_secs(30);
 ///     compile a caller that only uses these.
 pub struct VeridiffEngine {
     rx: Receiver<AgentEvent>,
+    /// Incremented per `trace_call` and echoed back on every message that call
+    /// produces, so late events can be told apart from the current call's and
+    /// dropped (see `collect_trace`). A `Cell` rather than `&mut self` purely to
+    /// keep `trace_call`'s existing `&self` signature -- this type is already
+    /// single-threaded by virtue of holding a `Receiver`.
+    next_call_id: std::cell::Cell<u64>,
 }
 
 impl VeridiffEngine {
@@ -600,7 +704,7 @@ impl VeridiffEngine {
         script
             .handle_message(RelayHandler { tx })
             .map_err(VeridiffError::Rpc)?;
-        Ok(Self { rx })
+        Ok(Self { rx, next_call_id: std::cell::Cell::new(0) })
     }
 
     /// Calls the function at `address` once with `args` and returns its
@@ -620,12 +724,15 @@ impl VeridiffEngine {
         options: TraceCallOptions,
     ) -> Result<Trace, VeridiffError> {
         let args_json: Vec<Value> = args.iter().map(Arg::to_json).collect();
+        let call_id = self.next_call_id.get() + 1;
+        self.next_call_id.set(call_id);
         let call_args = json!([
             format!("{address:#x}"),
             args_json,
             ret_type,
             module,
             options.warm_up,
+            call_id,
         ]);
 
         script
@@ -641,14 +748,7 @@ impl VeridiffEngine {
         // the channel is already fully drained, so correctness here doesn't
         // depend on being right about frida-core's internal thread model.
 
-        let mut builder = TraceBuilder::default();
-        loop {
-            match self.rx.recv_timeout(RECV_TIMEOUT) {
-                Ok(AgentEvent::Done { return_value }) => return Ok(builder.into_trace(return_value)),
-                Ok(event) => builder.absorb(event),
-                Err(_) => return Err(VeridiffError::IncompleteTrace),
-            }
-        }
+        collect_trace(&self.rx, call_id)
     }
 
     /// Disassembles one block of `trace`, given its module-relative start offset.
@@ -770,6 +870,14 @@ impl VeridiffEngine {
     /// divergence -- without the two paths actually having merged back into
     /// the same control flow. See `resync_confirmed` for how a candidate
     /// earns acceptance instead of just being the first thing found.
+    ///
+    /// When the scan runs one trace out while the other still has blocks --
+    /// either at the very start (one trace is a strict prefix of the other) or
+    /// in the tail after an accepted resync -- that difference is reported as a
+    /// final region with `branch_a` or `branch_b` set to `None`, whichever side
+    /// ended. Before 0.3.0 it was silently dropped, so an empty result could
+    /// mean either "identical" or "differs only in length"; now the result is
+    /// empty if and only if `find_first_divergence` returns `None`.
     pub fn find_divergence_regions(
         trace_a: &Trace,
         trace_b: &Trace,
@@ -790,7 +898,27 @@ impl VeridiffEngine {
                 i += 1;
                 j += 1;
             }
-            if i >= a.len() || j >= b.len() {
+            let (a_done, b_done) = (i >= a.len(), j >= b.len());
+            if a_done || b_done {
+                if a_done != b_done {
+                    // Exactly one trace ran out while the other still has
+                    // blocks. That IS a difference -- `find_first_divergence`
+                    // reports it -- but this function used to just `break` and
+                    // return nothing for it, so two traces where one is a
+                    // strict prefix of the other came back as an empty region
+                    // list, i.e. indistinguishable from "identical". Emitting
+                    // it keeps the two functions' answers consistent: regions
+                    // is empty if and only if find_first_divergence is None.
+                    regions.push(DivergenceRegion {
+                        common_index: i as isize - 1,
+                        last_common_block: if i > 0 { Some(a[i - 1]) } else { None },
+                        branch_a: a.get(i).copied(),
+                        branch_b: b.get(j).copied(),
+                        resync_index_a: None,
+                        resync_index_b: None,
+                        resync_block: None,
+                    });
+                }
                 break;
             }
 
@@ -827,8 +955,8 @@ impl VeridiffEngine {
             regions.push(DivergenceRegion {
                 common_index: i as isize - 1,
                 last_common_block: if i > 0 { Some(a[i - 1]) } else { None },
-                branch_a: a[i],
-                branch_b: b[j],
+                branch_a: Some(a[i]),
+                branch_b: Some(b[j]),
                 resync_index_a: resync.map(|(p, ..)| p),
                 resync_index_b: resync.map(|(_, k, _)| k),
                 resync_block: resync.map(|(_, _, v)| v),
@@ -883,14 +1011,29 @@ impl VeridiffEngine {
     /// trace exhausted, the other still has unexamined blocks -- that must
     /// be rejected, because the continuing trace's future was simply never
     /// looked at.
+    /// That fix was itself incomplete, which is what this version closes
+    /// (found 2026-09-30 by re-reading against this very doc comment): it
+    /// special-cased only *zero* blocks remaining, while the general
+    /// `MIN_CONFIRM.min(a_remaining).min(b_remaining)` window silently shrank
+    /// below MIN_CONFIRM whenever either trace had 1 or 2 blocks left. So
+    /// `a=[...,0x30,0xD0,0xAA]` against `b=[...,0x31,0xD0,0xAA,0xBB,0xBC,0xBD]`
+    /// confirmed `0xD0` on a single matching block -- the same "accepted on
+    /// less evidence than MIN_CONFIRM demands, while the longer trace's tail
+    /// goes unexamined" shape, one block further along. The rule now states
+    /// the intent directly: a short window is acceptable only when it is short
+    /// because BOTH traces ran out together, and then every remaining block
+    /// must match.
     fn resync_confirmed(a: &[u64], b: &[u64], p: usize, bj: usize) -> bool {
         let a_remaining = a.len() - (p + 1);
         let b_remaining = b.len() - (bj + 1);
-        if a_remaining == 0 && b_remaining == 0 {
-            return true; // both traces end here together -- nothing left to disagree on
-        }
         let len = Self::MIN_CONFIRM.min(a_remaining).min(b_remaining);
-        len > 0 && a[p + 1..p + 1 + len] == b[bj + 1..bj + 1 + len]
+        if len < Self::MIN_CONFIRM {
+            // Mutual exhaustion (including both ending exactly at the
+            // candidate, where both slices are empty) is exhaustive evidence.
+            // Anything else short is missing evidence, not proof.
+            return a_remaining == b_remaining && a[p + 1..] == b[bj + 1..];
+        }
+        a[p + 1..p + 1 + len] == b[bj + 1..bj + 1 + len]
     }
 }
 
@@ -1028,10 +1171,10 @@ mod tests {
         let b = mk_trace(vec![0x10, 0x20, 0x31, 0x40, 0x50, 0x55, 0x58, 0x61, 0x70]);
         let regions = VeridiffEngine::find_divergence_regions(&a, &b, 16, 32);
         assert_eq!(regions.len(), 2);
-        assert_eq!(regions[0].branch_a, 0x30);
-        assert_eq!(regions[0].branch_b, 0x31);
+        assert_eq!(regions[0].branch_a, Some(0x30));
+        assert_eq!(regions[0].branch_b, Some(0x31));
         assert_eq!(regions[0].resync_block, Some(0x40));
-        assert_eq!(regions[1].branch_a, 0x60);
+        assert_eq!(regions[1].branch_a, Some(0x60));
         assert_eq!(regions[1].resync_block, Some(0x70));
     }
 
@@ -1057,8 +1200,8 @@ mod tests {
         let b = mk_trace(vec![0x10, 0x20, 0x31, 0xD0, 0xBB, 0xBC, 0xBD]);
         let regions = VeridiffEngine::find_divergence_regions(&a, &b, 16, 32);
         assert_eq!(regions.len(), 1);
-        assert_eq!(regions[0].branch_a, 0x30);
-        assert_eq!(regions[0].branch_b, 0x31);
+        assert_eq!(regions[0].branch_a, Some(0x30));
+        assert_eq!(regions[0].branch_b, Some(0x31));
         assert_eq!(
             regions[0].resync_block, None,
             "a single-block dispatcher fly-by must not be accepted as a real merge"
@@ -1134,6 +1277,190 @@ mod tests {
         assert_eq!(regions[0].resync_block, Some(0xD0));
         assert_eq!(regions[0].resync_index_a, Some(3));
         assert_eq!(regions[0].resync_index_b, Some(3));
+    }
+
+    // ------------------------------------------------------------------
+    // 0.3.0: the 0.2.1 resync fix was incomplete, and find_divergence_regions
+    // silently dropped a trailing length difference. Mirrors the Python suite
+    // test-for-test; see resync_confirmed's and find_divergence_regions' doc
+    // comments.
+    // ------------------------------------------------------------------
+
+    /// The gap the 0.2.1 fix left behind: it special-cased only ZERO blocks
+    /// remaining, so a trace with 1 or 2 blocks left still shrank the
+    /// confirmation window below MIN_CONFIRM and confirmed on that. Trace A has
+    /// exactly one block (0xAA) after the shared dispatcher 0xD0 while trace B
+    /// has four -- 0xAA then three genuinely different ones, never examined.
+    #[test]
+    fn resync_is_rejected_when_one_trace_runs_out_a_block_after_the_candidate() {
+        let a = mk_trace(vec![0x10, 0x20, 0x30, 0xD0, 0xAA]);
+        let b = mk_trace(vec![0x10, 0x20, 0x31, 0xD0, 0xAA, 0xBB, 0xBC, 0xBD]);
+        let regions = VeridiffEngine::find_divergence_regions(&a, &b, 16, 32);
+        assert_eq!(
+            regions[0].resync_block, None,
+            "a confirmation window shortened by one trace running out is missing evidence, \
+             not proof -- only mutual exhaustion is exhaustive"
+        );
+    }
+
+    /// Companion to the test above, covering the k=1 and k=2 cases the "both
+    /// exhausted" rule must still accept: the window is short because BOTH
+    /// traces ended, and every remaining block matches. Rejecting these would
+    /// be the opposite error -- refusing exhaustive evidence.
+    #[test]
+    fn resync_is_accepted_when_both_traces_run_out_together_after_a_short_tail() {
+        for tail in [vec![0xAA], vec![0xAA, 0xAB]] {
+            let mut av = vec![0x10, 0x20, 0x30, 0xD0];
+            let mut bv = vec![0x10, 0x20, 0x31, 0xD0];
+            av.extend(&tail);
+            bv.extend(&tail);
+            let regions = VeridiffEngine::find_divergence_regions(&mk_trace(av), &mk_trace(bv), 16, 32);
+            assert_eq!(regions[0].resync_block, Some(0xD0), "tail {tail:?}");
+            assert_eq!(regions[0].resync_index_a, Some(3), "tail {tail:?}");
+        }
+    }
+
+    /// Pre-0.3.0 this returned an empty Vec -- indistinguishable from
+    /// "identical" -- even though find_first_divergence correctly reported a
+    /// difference at index 3.
+    #[test]
+    fn trailing_difference_is_reported_when_one_trace_is_a_prefix_of_the_other() {
+        let a = mk_trace(vec![0x10, 0x20, 0x30]);
+        let b = mk_trace(vec![0x10, 0x20, 0x30, 0x40, 0x50]);
+        let regions = VeridiffEngine::find_divergence_regions(&a, &b, 4096, 32);
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].branch_a, None, "trace A ran out; no block to name on its side");
+        assert_eq!(regions[0].branch_b, Some(0x40));
+        assert_eq!(regions[0].last_common_block, Some(0x30));
+        assert_eq!(regions[0].resync_block, None);
+    }
+
+    /// The same tail case, but reached after a genuine merge rather than at the
+    /// start. The shared run has to be at least MIN_CONFIRM long for the resync
+    /// to confirm at all -- with a shorter one the stricter 0.3.0 rule correctly
+    /// refuses a merge whose window was cut short by A running out.
+    #[test]
+    fn trailing_difference_is_reported_after_an_accepted_resync() {
+        let a = mk_trace(vec![0x10, 0x20, 0x30, 0x40, 0x50, 0x55, 0x58]);
+        let b = mk_trace(vec![0x10, 0x20, 0x31, 0x40, 0x50, 0x55, 0x58, 0x60]);
+        let regions = VeridiffEngine::find_divergence_regions(&a, &b, 16, 32);
+        assert_eq!(regions.len(), 2);
+        assert_eq!(regions[0].resync_block, Some(0x40));
+        assert_eq!(regions[1].branch_a, None);
+        assert_eq!(regions[1].branch_b, Some(0x60));
+    }
+
+    /// The invariant that would have caught the dropped-tail bug: the two
+    /// public entry points must never disagree about *whether* the traces
+    /// differ, only about how much detail they give.
+    #[test]
+    fn regions_is_empty_exactly_when_there_is_no_first_divergence() {
+        let cases: [(Vec<u64>, Vec<u64>); 6] = [
+            (vec![0x10, 0x20], vec![0x10, 0x20]),             // identical
+            (vec![0x10, 0x20], vec![0x10, 0x20, 0x30]),       // A a strict prefix of B
+            (vec![0x10, 0x20, 0x30], vec![0x10, 0x20]),       // B a strict prefix of A
+            (vec![0x10, 0x20, 0x30], vec![0x10, 0x99, 0x30]), // mid-trace difference
+            (vec![], vec![]),                                 // both empty
+            (vec![], vec![0x10]),                             // one empty
+        ];
+        for (av, bv) in cases {
+            let (a, b) = (mk_trace(av.clone()), mk_trace(bv.clone()));
+            let has_divergence = VeridiffEngine::find_first_divergence(&a, &b).is_some();
+            let regions = VeridiffEngine::find_divergence_regions(&a, &b, 4096, 32);
+            assert_eq!(
+                !regions.is_empty(),
+                has_divergence,
+                "{av:?} vs {bv:?}: regions={regions:?} divergence={has_divergence}"
+            );
+        }
+    }
+
+    #[test]
+    fn first_region_agrees_with_the_first_divergence_point() {
+        let a = mk_trace(vec![0x10, 0x20, 0x30, 0xAA]);
+        let b = mk_trace(vec![0x10, 0x20, 0x99, 0xBB]);
+        let d = VeridiffEngine::find_first_divergence(&a, &b).unwrap();
+        let r = VeridiffEngine::find_divergence_regions(&a, &b, 4096, 32)[0];
+        assert_eq!(r.common_index + 1, d.index as isize);
+        assert_eq!(r.last_common_block, d.last_common_block);
+        assert_eq!((r.branch_a, r.branch_b), (d.block_a, d.block_b));
+    }
+
+    // ------------------------------------------------------------------
+    // 0.3.0: stale-event rejection by callId.
+    //
+    // Live-found on a recursive target: Stalker.unfollow() doesn't stop
+    // instrumented execution instantly, so outer frames keep emitting block
+    // events after traceCall returned. Those arrived during the NEXT
+    // trace_call and were absorbed into it -- two identical calls reported a
+    // divergence at index 0. collect_trace is split out of trace_call
+    // precisely so this is reachable without Frida or a live target.
+    // ------------------------------------------------------------------
+
+    /// A 32-byte GUM_BLOCK record for one (start, end) pair, 64-bit layout.
+    fn block_chunk(start: u64, end: u64) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&GUM_BLOCK.to_le_bytes());
+        buf.extend_from_slice(&[0u8; 4]);
+        buf.extend_from_slice(&start.to_le_bytes());
+        buf.extend_from_slice(&end.to_le_bytes());
+        buf.extend_from_slice(&[0u8; 8]);
+        buf
+    }
+
+    fn meta_event(call_id: u64) -> AgentEvent {
+        AgentEvent::Meta {
+            call_id,
+            pointer_size: 8,
+            module_name: "t".into(),
+            module_base: 0x400000,
+            module_size: 0x10000,
+        }
+    }
+
+    #[test]
+    fn collect_trace_keeps_only_the_events_belonging_to_this_call() {
+        let (tx, rx) = mpsc::channel();
+        // Call 1 is already over, but its meta and a late chunk are still in
+        // flight -- exactly the live-observed ordering.
+        tx.send(meta_event(1)).unwrap();
+        tx.send(AgentEvent::Chunk { call_id: 1, data: block_chunk(0x400AAA, 0x400AAB) }).unwrap();
+        tx.send(AgentEvent::Done { call_id: 1, return_value: Some("stale".into()) }).unwrap();
+        // Call 2 is the one being collected.
+        tx.send(meta_event(2)).unwrap();
+        tx.send(AgentEvent::Chunk { call_id: 2, data: block_chunk(0x401000, 0x401010) }).unwrap();
+        tx.send(AgentEvent::Done { call_id: 2, return_value: Some("fresh".into()) }).unwrap();
+
+        let trace = collect_trace(&rx, 2).expect("call 2 must complete");
+        assert_eq!(trace.blocks, vec![0x1000], "call 1's 0xAAA block must not appear");
+        assert_eq!(trace.return_value.as_deref(), Some("fresh"));
+    }
+
+    /// The inverse guard: a stale `done` must not be mistaken for this call's,
+    /// which would return a truncated trace early.
+    #[test]
+    fn collect_trace_does_not_finish_on_a_stale_done() {
+        let (tx, rx) = mpsc::channel();
+        tx.send(AgentEvent::Done { call_id: 1, return_value: Some("stale".into()) }).unwrap();
+        tx.send(meta_event(2)).unwrap();
+        tx.send(AgentEvent::Chunk { call_id: 2, data: block_chunk(0x401000, 0x401010) }).unwrap();
+        tx.send(AgentEvent::Done { call_id: 2, return_value: Some("fresh".into()) }).unwrap();
+
+        let trace = collect_trace(&rx, 2).expect("must keep reading past the stale done");
+        assert_eq!(trace.blocks, vec![0x1000]);
+        assert_eq!(trace.return_value.as_deref(), Some("fresh"));
+    }
+
+    #[test]
+    fn chunk_without_a_call_id_is_logged_not_absorbed() {
+        let (tx, rx) = mpsc::channel();
+        let mut handler = RelayHandler { tx };
+        let payload = serde_json::json!({"type": "chunk"});
+        handler.on_message(Message::Send(MessageSend { payload }), Some(vec![0xAA]));
+        match rx.try_recv() {
+            Ok(AgentEvent::Log(_)) => {}
+            other => panic!("expected a Log for an unattributable chunk, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1318,6 +1645,7 @@ mod tests {
         let mut handler = RelayHandler { tx };
         let payload = serde_json::json!({
             "type": "meta",
+            "callId": 1,
             "pointerSize": 8,
             "moduleName": "licensecheck",
             "moduleBase": "0x400000",
@@ -1326,7 +1654,7 @@ mod tests {
         handler.on_message(Message::Send(MessageSend { payload }), None);
 
         match rx.try_recv() {
-            Ok(AgentEvent::Meta { pointer_size, module_name, module_base, module_size }) => {
+            Ok(AgentEvent::Meta { pointer_size, module_name, module_base, module_size, .. }) => {
                 assert_eq!(pointer_size, 8);
                 assert_eq!(module_name, "licensecheck");
                 assert_eq!(module_base, 0x400000);

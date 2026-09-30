@@ -60,8 +60,7 @@ fn main() {
 
     // Both calls happen with the process still suspended at its post-spawn,
     // post-relocation stop point (resume() is only called afterwards) so
-    // there's no race with the target's own main() -- see trace_call's doc
-    // comment in lib.rs. This requires the target function not to depend on
+    // there's no race with the target's own main(). This requires the target function not to depend on
     // state that's normally set up by constructors/main() that haven't run
     // yet; if yours does, call engine.resume-equivalent (device.resume) and
     // arrange your own synchronization before tracing.

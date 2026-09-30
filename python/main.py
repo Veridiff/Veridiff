@@ -32,7 +32,7 @@ import sys
 from dataclasses import dataclass
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple, Union
 
-__version__ = "0.2.4"
+__version__ = "0.3.0"
 
 try:
     import frida  # type: ignore
@@ -76,7 +76,7 @@ function nativeArgType(spec) {
 }
 
 rpc.exports = {
-    traceCall(targetHex, args, retType, moduleName, warmUp) {
+    traceCall(targetHex, args, retType, moduleName, warmUp, callId) {
         const target = ptr(targetHex);
         const mod = moduleName
             ? Process.getModuleByName(moduleName)
@@ -85,8 +85,19 @@ rpc.exports = {
             throw new Error('no module contains address ' + targetHex + '; pass moduleName explicitly');
         }
 
+        // Every message this call emits is stamped with `callId`, and the host
+        // drops anything carrying a different one. Stalker.unfollow() does not
+        // stop instrumented execution instantly: a thread already inside
+        // generated code keeps running it, and those events can be delivered
+        // AFTER traceCall has returned -- landing in the NEXT call's message
+        // stream, where the host would otherwise prepend them to an unrelated
+        // trace. Found live: two identical calls to a recursive function
+        // reported a divergence at index 0 purely from the previous call's
+        // late blocks. The onReceive closure below captures this callId, so
+        // stale chunks carry the old value and are discarded by construction.
         send({
             type: 'meta',
+            callId,
             pointerSize: Process.pointerSize,
             moduleName: mod.name,
             moduleBase: mod.base.toString(),
@@ -129,6 +140,7 @@ rpc.exports = {
         const tid = Process.getCurrentThreadId();
 
         let blockCount = 0;
+        let depth = 0;
         let stalkerCleanedUp = false;
         const stopStalking = () => {
             if (stalkerCleanedUp) return; // onLeave and the finally block both call this
@@ -147,17 +159,36 @@ rpc.exports = {
         // Stalker just never engages unless bracketed this way). So a
         // throwaway Interceptor hook on the target itself is used purely to
         // get Stalker engaged for the one call we're about to make.
+        //
+        // Both callbacks are gated twice, and both gates fix bugs found by
+        // tracing a real process:
+        //
+        // 1. `this.threadId !== tid`: Interceptor hooks are process-wide, not
+        //    per-thread. Any other thread calling this same function while we
+        //    trace would otherwise run Stalker.follow() for OUR thread id from
+        //    ITS callback, and its onLeave would stop stalking in the middle of
+        //    the call actually being measured.
+        // 2. `depth`: for a recursive (or otherwise re-entrant) target, onLeave
+        //    fires innermost-first. Unconditionally stopping there cut tracing
+        //    off while the outer frames were still running -- the trace lost
+        //    every outer frame's unwind blocks, and those blocks then leaked
+        //    into the next call (see the callId comment above). Follow on the
+        //    outermost entry only, stop on the outermost return only.
         const listener = Interceptor.attach(target, {
             onEnter() {
+                if (this.threadId !== tid) return;
+                if (depth++ > 0) return;
                 Stalker.follow(tid, {
                     events: { block: true },
                     onReceive(buffer) {
                         blockCount += buffer.byteLength / (4 * Process.pointerSize);
-                        send({ type: 'chunk' }, buffer);
+                        send({ type: 'chunk', callId }, buffer);
                     },
                 });
             },
             onLeave() {
+                if (this.threadId !== tid) return;
+                if (--depth > 0) return;
                 stopStalking();
             },
         });
@@ -166,6 +197,7 @@ rpc.exports = {
             const returnValue = fn(...nativeArgs);
             send({
                 type: 'done',
+                callId,
                 blockCount,
                 returnValue: retType === 'void' ? null : returnValue.toString(),
             });
@@ -381,12 +413,18 @@ class DivergencePoint:
 
 @dataclass(frozen=True)
 class DivergenceRegion:
-    """One split-then-possibly-rejoin episode, as found by the resync scan."""
+    """One split-then-possibly-rejoin episode, as found by the resync scan.
+
+    ``branch_a``/``branch_b`` are the first differing block on each side. Either
+    is None when that trace simply ran out while the other kept going -- a real
+    difference with no block to name on the exhausted side, which is why these
+    are optional rather than always present (see `find_divergence_regions`).
+    """
 
     common_index: int
     last_common_block: Optional[int]
-    branch_a: int
-    branch_b: int
+    branch_a: Optional[int]
+    branch_b: Optional[int]
     resync_index_a: Optional[int]
     resync_index_b: Optional[int]
     resync_block: Optional[int]
@@ -420,6 +458,12 @@ class VeridiffEngine:
         self._chunks: List[bytes] = []
         self._meta: Dict[str, Any] = {}
         self._done: Dict[str, Any] = {}
+        # Incremented per trace_call and echoed back on every message that call
+        # produces, so events that arrive late (after the call that produced
+        # them already returned) can be told apart from the current call's and
+        # dropped. See the callId comment in _AGENT_SOURCE for why they arrive
+        # late at all.
+        self._call_id = 0
 
     # ---- process / session lifecycle ----
 
@@ -474,6 +518,14 @@ class VeridiffEngine:
             return
         payload = message["payload"]
         kind = payload.get("type")
+        if payload.get("callId") != self._call_id:
+            # A leftover message from an earlier traceCall that has already
+            # returned. Absorbing it would splice a previous call's blocks into
+            # whatever trace is being collected now -- live-observed as a
+            # divergence at index 0 between two identical calls to a recursive
+            # target. Dropped, not logged: for a re-entrant target this is
+            # expected traffic, not an anomaly.
+            return
         if kind == "meta":
             self._meta = payload
         elif kind == "chunk":
@@ -512,13 +564,16 @@ class VeridiffEngine:
         self._chunks = []
         self._meta = {}
         self._done = {}
+        self._call_id += 1
 
         payload_args = [a.to_payload() for a in args]
         # exports_sync blocks until the agent's traceCall() returns, which is
         # strictly after its own send('done') call (same function, sequential
         # statements) -- so every chunk/meta/done message is guaranteed to
         # have already reached _on_message by the time this call returns.
-        self._script.exports_sync.trace_call(hex(address), payload_args, ret_type, module, warm_up)
+        self._script.exports_sync.trace_call(
+            hex(address), payload_args, ret_type, module, warm_up, self._call_id
+        )
 
         if not self._meta:
             raise RuntimeError("agent produced no trace metadata (target module unresolved)")
@@ -643,13 +698,30 @@ class VeridiffEngine:
         trace exhausted, the other still has unexamined blocks -- that must
         be rejected, because the continuing trace's future was simply never
         looked at.
+
+        That fix was itself incomplete, which is what this version closes
+        (found 2026-09-30 by re-reading against this very docstring): it
+        special-cased only *zero* blocks remaining, while the general
+        `min(_MIN_CONFIRM, a_remaining, b_remaining)` window silently
+        shrank below _MIN_CONFIRM whenever either trace had 1 or 2 blocks
+        left. So `a=[...,0x30,0xD0,0xAA]` against
+        `b=[...,0x31,0xD0,0xAA,0xBB,0xBC,0xBD]` confirmed 0xD0 on a single
+        matching block -- the same "accepted on less evidence than
+        _MIN_CONFIRM demands, while the longer trace's tail goes
+        unexamined" shape, just one block further along. The rule now
+        states the intent directly: a short window is acceptable only when
+        it is short because BOTH traces ran out together, and then every
+        remaining block must match.
         """
         a_remaining = len(a) - (p + 1)
         b_remaining = len(b) - (bj + 1)
-        if a_remaining == 0 and b_remaining == 0:
-            return True  # both traces end here together -- nothing left to disagree on
         length = min(VeridiffEngine._MIN_CONFIRM, a_remaining, b_remaining)
-        return length > 0 and a[p + 1 : p + 1 + length] == b[bj + 1 : bj + 1 + length]
+        if length < VeridiffEngine._MIN_CONFIRM:
+            # Mutual exhaustion (including both ending exactly at the
+            # candidate, where both slices are empty) is exhaustive evidence.
+            # Anything else short is missing evidence, not proof.
+            return a_remaining == b_remaining and a[p + 1 :] == b[bj + 1 :]
+        return a[p + 1 : p + 1 + length] == b[bj + 1 : bj + 1 + length]
 
     @staticmethod
     def find_divergence_regions(
@@ -690,6 +762,14 @@ class VeridiffEngine:
         divergence -- without the two paths actually having merged back into
         the same control flow. See `_resync_confirmed` for how a candidate
         earns acceptance instead of just being the first thing found.
+
+        When the scan runs one trace out while the other still has blocks --
+        either at the very start (one trace is a strict prefix of the other)
+        or in the tail after an accepted resync -- that difference is reported
+        as a final region with `branch_a` or `branch_b` set to None, whichever
+        side ended. Before 0.3.0 it was silently dropped, so an empty result
+        could mean either "identical" or "differs only in length"; now the
+        result is empty if and only if `find_first_divergence` returns None.
         """
         a, b = trace_a.blocks, trace_b.blocks
         i = j = 0
@@ -698,7 +778,28 @@ class VeridiffEngine:
             while i < len(a) and j < len(b) and a[i] == b[j]:
                 i += 1
                 j += 1
-            if i >= len(a) or j >= len(b):
+            a_done, b_done = i >= len(a), j >= len(b)
+            if a_done or b_done:
+                if a_done != b_done:
+                    # Exactly one trace ran out while the other still has
+                    # blocks. That IS a difference -- `find_first_divergence`
+                    # reports it -- but this function used to just `break` and
+                    # return nothing for it, so two traces where one is a strict
+                    # prefix of the other came back as an empty region list,
+                    # i.e. indistinguishable from "identical". Emitting it keeps
+                    # the two functions' answers consistent: regions is empty if
+                    # and only if find_first_divergence returns None.
+                    regions.append(
+                        DivergenceRegion(
+                            common_index=i - 1,
+                            last_common_block=a[i - 1] if i > 0 else None,
+                            branch_a=a[i] if not a_done else None,
+                            branch_b=b[j] if not b_done else None,
+                            resync_index_a=None,
+                            resync_index_b=None,
+                            resync_block=None,
+                        )
+                    )
                 break
 
             b_hi = min(j + resync_window, len(b))
@@ -769,8 +870,8 @@ if __name__ == "__main__":
         engine.spawn(program)
 
         # warm_up=True so this demo doesn't itself fall into the PLT/GOT
-        # lazy-binding confound (see Trace.find_divergence_regions' and
-        # trace_call's docstrings) -- without it, run A's first call into
+        # lazy-binding confound (see VeridiffEngine.find_divergence_regions'
+        # and trace_call's docstrings) -- without it, run A's first call into
         # any externally-linked function would show a spurious divergence
         # against run B that has nothing to do with arg_a vs arg_b.
         trace_a = engine.trace_call(target_address, [Arg("string", arg_a)], ret_type="int", warm_up=True)

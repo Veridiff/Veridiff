@@ -9,12 +9,15 @@ your two runs weren't going to end the same way.
 
 That's the whole product. Not a framework. Not a platform. An engine.
 
-**Current release: v0.2.4.** ARM64 is live-verified end to end, on real
-hardware, in both engines -- see **Proof, Not Promises** below. v0.2.4
-itself is a small follow-up: the automated review pass v0.2.3 shipped
-without waiting for found a real asymmetry (Python was missing a length
-check Rust had just gained) plus a misleading error variant, both fixed.
-[`CHANGELOG.md`](CHANGELOG.md) carries the full history back to 0.1.0.
+**Current release: v0.3.0.** Fixes the worst bug this project has had: a
+**re-entrant (recursive) target** reported a *false divergence between two
+identical calls*, because tracing stopped at the innermost return and the
+outer frames' late events leaked into the next call. Tracing a function
+another thread was calling concurrently hung forever. Both fixed in the
+agent, live-verified on x86, alongside two host-side correctness fixes.
+Breaking: `DivergenceRegion`'s `branch_a`/`branch_b` are now `Option` in
+Rust. Details in **Field notes**; full history in
+[`CHANGELOG.md`](CHANGELOG.md).
 
 ---
 
@@ -162,6 +165,15 @@ untouched; only the compiler target changed. Full walkthrough, including
 why this needs `spawn()` (not `attach()` to a system-library hook) and
 what didn't work first, is in **Field notes** below.
 
+One disclosure about this particular capture: it was produced by v0.2.3's
+agent, and no ARM64 device was connected when v0.3.0's agent changes were
+made. Those changes key off thread ids and call depth, with no
+instruction-level assumptions, and the x86 half of this proof reproduces
+byte-for-byte on v0.3.0 — but `check_license` is neither recursive nor
+called from a second thread, so "v0.3.0 would print the same thing here"
+is reasoning from the x86 result, not a measurement on the phone. Stated
+rather than quietly left for you to assume.
+
 ---
 
 ## How it works
@@ -206,8 +218,12 @@ that question, in O(min(n,m)) with no hashing, instead of O(N·D) for
 Myers or O(N log N) for the best hash-assisted variants. `find_divergence_regions`
 adds a bounded-lookahead resync on top for the case where a check runs
 several independent conditionals in sequence — still not a general
-diff, still O(N + regions × window), still answering "where did they
-split" rather than "how do these align."
+diff, still O(N + regions × window) in the typical case (see
+`find_divergence_regions`' own docs for the quadratic worst case and why
+it's accepted), still answering "where did they split" rather than "how do
+these align." As of v0.3.0 it also reports a trailing region when one trace
+simply runs out while the other continues, so an empty result means
+"identical" and nothing else.
 
 **Disassembly happens inside the agent, not the host.** Frida-gum
 already bundles Capstone and exposes it as `Instruction.parse()`. Both
@@ -369,6 +385,16 @@ branch classification**). Both are additive on the Python side; the Rust
 breaking change for existing callers on this pre-1.0 crate -- pass
 `TraceCallOptions::default()` for the old behavior.
 
+New in v0.3.0: `DivergenceRegion`'s `branch_a`/`branch_b` are now
+`Option<u64>` in Rust (`Optional[int]` in Python, where nothing enforced the
+old annotation anyway), so the case "one trace ran out while the other kept
+going" can be reported instead of silently dropped. That's a breaking change
+for Rust callers reading those fields -- they were plain `u64` through
+v0.2.4. Everything else in v0.3.0 is a behavior fix behind unchanged
+signatures: the same calls simply stop lying about re-entrant targets. Note
+that the agent and host now exchange a per-call id, so a host and an
+`AGENT_SOURCE` from different versions must not be mixed.
+
 ---
 
 ## Field notes (landmines we already stepped on)
@@ -430,10 +456,9 @@ trusting synthetic test data.
   last line in both, purely so the spawned process doesn't get left
   stopped. If you're extending either demo, keep it that way.
 
-- **The most serious bug found in this project so far: `resync_confirmed`
-  compared a candidate resync point against *itself*, not against what
-  came after it.** `a[p..p+len]` vs `b[bj..bj+len]` starts AT the
-  candidate — and `bj` is only ever found because `b[bj] == a[p]` already
+- **`resync_confirmed` compared a candidate resync point against *itself*,
+  not against what came after it.** `a[p..p+len]` vs `b[bj..bj+len]` starts
+  AT the candidate — and `bj` is only ever found because `b[bj] == a[p]` already
   holds, so that leading element is a trivial self-match by construction.
   Whenever either trace happened to end exactly at the candidate, `len`
   collapsed to 1 and the "confirmation" checked nothing but that
@@ -448,7 +473,24 @@ trusting synthetic test data.
   evidence); one trace ending while the other continues is the bug above
   and is now rejected. Found by an independent review pass, not by the
   test suite that existed at the time — the tests that would have caught
-  it exist now.
+  it exist now. This held the title of most serious bug in the project's
+  history through v0.2.4; the re-entrancy bug below, found in v0.3.0, is
+  worse, because it broke `find_first_divergence` itself rather than the
+  resync heuristic layered above it.
+
+  **That fix was itself incomplete, and v0.3.0 finishes it.** It
+  special-cased only *zero* blocks remaining after the candidate, while the
+  general `min(MIN_CONFIRM, a_remaining, b_remaining)` window still shrank
+  below `MIN_CONFIRM` whenever either trace had one or two blocks left — so
+  `a=[…,0x30,0xD0,0xAA]` against `b=[…,0x31,0xD0,0xAA,0xBB,0xBC,0xBD]`
+  confirmed `0xD0` on a *single* matching block while B's three remaining,
+  genuinely different blocks went unexamined. The same shape as the original
+  bug, one block further along, and found the same way: by re-reading the
+  fix against the docstring that describes what it was supposed to
+  guarantee. The rule now states the intent directly instead of enumerating
+  cases — a confirmation window shorter than `MIN_CONFIRM` is acceptable
+  only when it is short *because both traces ran out together*, and then
+  every remaining block must match.
 
 - **Warm-up mode's untraced pre-call shared the same allocated argument
   buffer as the traced call that followed it.** For a `'string'`
@@ -460,6 +502,57 @@ trusting synthetic test data.
   argument. Fixed by giving the warm-up call its own allocation. Not
   live-verified against a self-mutating target specifically — none was
   built to test it, said plainly rather than implied.
+
+- **Tracing a re-entrant (recursive) target used to produce a false
+  divergence between two *identical* calls — the worst bug this project has
+  had, because it broke the headline function rather than a heuristic above
+  it.** Two mechanisms, one root cause, both found by tracing a four-line
+  recursive C function rather than by any test:
+
+  1. `Interceptor.attach`'s `onLeave` fires **innermost-first**. Stopping
+     Stalker there cut tracing off while the outer frames were still
+     running, so the trace lost every outer frame's unwind block.
+  2. `Stalker.unfollow()` does **not** stop instrumented execution
+     instantly. Those outer frames kept running already-generated
+     instrumented code and kept emitting block events — delivered *after*
+     `traceCall` had returned, i.e. into the **next** call's message stream,
+     where the host prepended them to an unrelated trace.
+
+  Measured, on `depth(2)` of a plain `int depth(int n) { return n <= 0 ? 0 :
+  1 + depth(n-1); }`, traced twice with the same argument: 9 blocks then 11
+  blocks, `find_first_divergence` reporting a divergence at **index 0**. For
+  a tool whose entire promise is "the traces differ here", silently
+  inventing a difference between two identical runs is as bad as it gets.
+  Fixed by tracking call depth in the agent — follow on the outermost entry
+  only, stop on the outermost return only — and by stamping every message
+  with the id of the `traceCall` that produced it, so late events are
+  discarded by construction instead of being absorbed by whoever is
+  listening next. After the fix, both engines return byte-identical
+  11-block traces for `depth(2)` and `None` for the diff, and the full
+  sequence matches the expected one derived by hand from `objdump`, unwind
+  blocks included.
+
+- **A function another thread is calling concurrently used to hang
+  `trace_call` forever.** `Interceptor` hooks are process-wide, not
+  per-thread: another thread entering the target ran `Stalker.follow()` for
+  *our* thread id from *its* callback, and its `onLeave` stopped stalking in
+  the middle of the call actually being measured. Reproduced with a target
+  whose background thread calls the traced function in a loop — the very
+  first `trace_call` never returned (killed at 75s). Fixed by gating both
+  callbacks on `this.threadId !== tid`; the same target now returns three
+  identical 9-block traces. Honest limit: the fix is verified by the
+  symptom disappearing, and the precise mechanism of the *hang* (as opposed
+  to the obvious trace corruption) was never established.
+
+- **`close()` hangs if the spawned process was never resumed.** Observed
+  twice out of two attempts while building the recursion test above:
+  `script.unload()`/`session.detach()` on a process still suspended at its
+  post-spawn stop point never returns, while `resume()` then `close()`
+  always worked. Not investigated further and **not fixed in v0.3.0** —
+  documented because it costs real debugging time to rediscover. Both demos
+  call `resume()` before exiting, so neither shows the problem; if you write
+  your own harness that only ever traces a suspended target, resume it
+  before closing anyway.
 
 - **Live ARM64 testing took two attempts across v0.2.2 and v0.2.3, and the
   two failures on the way are as worth documenting as the eventual
@@ -505,8 +598,28 @@ trusting synthetic test data.
   `VeridiffEngine(device=...)` already took an arbitrary device, and
   Rust's engine not owning a `Device` meant the caller just used
   `DeviceType::USB` instead of local. Every real obstacle was in the
-  target binary and Frida's injection layer, never in this engine. Full
-  build recipe in `CLAUDE.md`'s Testing section.
+  target binary and Frida's injection layer, never in this engine.
+
+  The full recipe, so you don't have to rediscover it:
+
+  ```bash
+  # device side: frida-server's version must line up with your host frida
+  adb push frida-server-<ver>-android-arm64 /data/local/tmp/frida-server
+  adb shell chmod 755 /data/local/tmp/frida-server
+  adb shell "su -c '/data/local/tmp/frida-server -D &'"
+
+  # host side: build the SAME examples/licensecheck.c, dynamically linked
+  $ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android26-clang \
+      -O0 -fno-inline -o licensecheck-arm64 examples/licensecheck.c
+  adb push licensecheck-arm64 /data/local/tmp/licensecheck-arm64
+  adb shell chmod 755 /data/local/tmp/licensecheck-arm64
+  llvm-nm licensecheck-arm64 | grep check_license   # the offset, e.g. 0x798
+  ```
+
+  Then `frida.get_usb_device()` (Python) / `DeviceType::USB` (Rust),
+  `spawn()` the pushed binary, and resolve the module's runtime base once
+  before computing `base + offset` — Android requires PIE, so the load
+  address differs every run, exactly like any other ASLR target.
 
 ---
 

@@ -191,6 +191,147 @@ def test_resync_is_accepted_when_both_traces_are_exhausted_together_at_the_candi
     assert regions[0].resync_index_b == 3
 
 
+# --------------------------------------------------------------------------
+# 0.3.0: the v0.2.1 resync fix was incomplete, and find_divergence_regions
+# silently dropped a trailing length difference. See _resync_confirmed's and
+# find_divergence_regions' docstrings.
+# --------------------------------------------------------------------------
+
+
+def test_resync_is_rejected_when_one_trace_runs_out_a_block_after_the_candidate():
+    # The gap the v0.2.1 fix left behind: it special-cased only ZERO blocks
+    # remaining, so a trace with 1 or 2 blocks left still shrank the
+    # confirmation window below _MIN_CONFIRM and confirmed on that. Here trace
+    # A has exactly one block (0xAA) after the shared dispatcher 0xD0 while
+    # trace B has four -- 0xAA then three genuinely different ones that are
+    # never examined. One matching block is not three.
+    a = mk_trace([0x10, 0x20, 0x30, 0xD0, 0xAA])
+    b = mk_trace([0x10, 0x20, 0x31, 0xD0, 0xAA, 0xBB, 0xBC, 0xBD])
+    regions = veridiff.VeridiffEngine.find_divergence_regions(a, b, resync_window=16)
+    assert regions[0].resync_block is None, (
+        "a confirmation window shortened by one trace running out is missing "
+        "evidence, not proof -- only mutual exhaustion is exhaustive"
+    )
+
+
+@pytest.mark.parametrize("tail", [[0xAA], [0xAA, 0xAB]])
+def test_resync_is_accepted_when_both_traces_run_out_together_after_a_short_tail(tail):
+    # Companion to the test above, covering the k=1 and k=2 cases that the
+    # "both exhausted" rule must still accept: the window is short because
+    # BOTH traces ended, and every remaining block matches. Rejecting these
+    # would be the opposite error -- refusing exhaustive evidence.
+    a = mk_trace([0x10, 0x20, 0x30, 0xD0, *tail])
+    b = mk_trace([0x10, 0x20, 0x31, 0xD0, *tail])
+    regions = veridiff.VeridiffEngine.find_divergence_regions(a, b, resync_window=16)
+    assert regions[0].resync_block == 0xD0
+    assert regions[0].resync_index_a == 3
+
+
+def test_trailing_difference_is_reported_when_one_trace_is_a_prefix_of_the_other():
+    # Pre-0.3.0 this returned [] -- indistinguishable from "identical" -- even
+    # though find_first_divergence correctly reported a difference at index 3.
+    a = mk_trace([0x10, 0x20, 0x30])
+    b = mk_trace([0x10, 0x20, 0x30, 0x40, 0x50])
+    regions = veridiff.VeridiffEngine.find_divergence_regions(a, b)
+    assert len(regions) == 1
+    assert regions[0].branch_a is None, "trace A ran out; there is no block to name on its side"
+    assert regions[0].branch_b == 0x40
+    assert regions[0].last_common_block == 0x30
+    assert regions[0].resync_block is None
+
+
+def test_trailing_difference_is_reported_after_an_accepted_resync():
+    # The same tail case, but reached after a genuine merge rather than at the
+    # start: the traces split at 0x30/0x31, really rejoin at 0x40, stay
+    # together for the full _MIN_CONFIRM blocks, and then B alone continues.
+    # (The shared run has to be at least _MIN_CONFIRM long for the resync to
+    # confirm at all -- with a shorter one, the stricter 0.3.0 rule correctly
+    # refuses to confirm a merge whose window was cut short by A running out,
+    # and there is no second region to report.)
+    a = mk_trace([0x10, 0x20, 0x30, 0x40, 0x50, 0x55, 0x58])
+    b = mk_trace([0x10, 0x20, 0x31, 0x40, 0x50, 0x55, 0x58, 0x60])
+    regions = veridiff.VeridiffEngine.find_divergence_regions(a, b, resync_window=16)
+    assert len(regions) == 2
+    assert regions[0].resync_block == 0x40
+    assert regions[1].branch_a is None
+    assert regions[1].branch_b == 0x60
+
+
+@pytest.mark.parametrize(
+    "blocks_a, blocks_b",
+    [
+        ([0x10, 0x20], [0x10, 0x20]),                    # identical
+        ([0x10, 0x20], [0x10, 0x20, 0x30]),              # A a strict prefix of B
+        ([0x10, 0x20, 0x30], [0x10, 0x20]),              # B a strict prefix of A
+        ([0x10, 0x20, 0x30], [0x10, 0x99, 0x30]),        # mid-trace difference
+        ([], []),                                        # both empty
+        ([], [0x10]),                                    # one empty
+    ],
+)
+def test_regions_is_empty_exactly_when_there_is_no_first_divergence(blocks_a, blocks_b):
+    # The invariant that would have caught the dropped-tail bug: the two public
+    # entry points must never disagree about *whether* the traces differ, only
+    # about how much detail they give.
+    a, b = mk_trace(blocks_a), mk_trace(blocks_b)
+    has_divergence = veridiff.VeridiffEngine.find_first_divergence(a, b) is not None
+    regions = veridiff.VeridiffEngine.find_divergence_regions(a, b)
+    assert bool(regions) == has_divergence, f"{regions!r} vs divergence={has_divergence}"
+
+
+def test_first_region_agrees_with_the_first_divergence_point():
+    a = mk_trace([0x10, 0x20, 0x30, 0xAA])
+    b = mk_trace([0x10, 0x20, 0x99, 0xBB])
+    d = veridiff.VeridiffEngine.find_first_divergence(a, b)
+    r = veridiff.VeridiffEngine.find_divergence_regions(a, b)[0]
+    assert r.common_index + 1 == d.index
+    assert r.last_common_block == d.last_common_block
+    assert (r.branch_a, r.branch_b) == (d.block_a, d.block_b)
+
+
+# --------------------------------------------------------------------------
+# 0.3.0: stale-event rejection by callId.
+#
+# Live-found: Stalker.unfollow() doesn't stop instrumented execution
+# instantly, so a re-entrant target's outer frames keep emitting block events
+# after traceCall returned. Those arrived during the NEXT trace_call and were
+# absorbed into it -- two identical calls to a recursive function reported a
+# divergence at index 0. _on_message is a plain method, so the host half of
+# the fix is testable without Frida or a live target.
+# --------------------------------------------------------------------------
+
+
+def mk_bare_engine(call_id):
+    """A VeridiffEngine with just the message-handling state set up.
+
+    Bypasses __init__ deliberately: it requires the frida package and a live
+    device, neither of which _on_message touches.
+    """
+    eng = object.__new__(veridiff.VeridiffEngine)
+    eng._chunks, eng._meta, eng._done, eng._call_id = [], {}, {}, call_id
+    return eng
+
+
+def test_message_from_the_current_call_is_absorbed():
+    eng = mk_bare_engine(7)
+    eng._on_message({"type": "send", "payload": {"type": "chunk", "callId": 7}}, b"\xaa")
+    assert eng._chunks == [b"\xaa"]
+
+
+@pytest.mark.parametrize("stale_id", [6, 8, None])
+def test_message_from_another_call_is_dropped(stale_id):
+    # 6 = a previous call's late event (the live-observed case), 8 = a future
+    # id that cannot legitimately arrive yet, None = a message with no callId
+    # at all, i.e. an agent older than this host.
+    eng = mk_bare_engine(7)
+    payload = {"type": "chunk"}
+    if stale_id is not None:
+        payload["callId"] = stale_id
+    eng._on_message({"type": "send", "payload": payload}, b"\xaa")
+    eng._on_message({"type": "send", "payload": {"type": "meta", "callId": stale_id, "moduleBase": "0x1"}}, None)
+    assert eng._chunks == []
+    assert eng._meta == {}
+
+
 def test_block_event_parsing_64bit_skips_non_block_records():
     call_event = struct.pack("<IxxxxQQi", 1, 0x1111, 0x2222, 3) + b"\x00" * 4
     block_event = struct.pack("<IxxxxQQ", veridiff._GUM_BLOCK, 0x401000, 0x401010) + b"\x00" * 8

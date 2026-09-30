@@ -12,8 +12,8 @@ venv/
 .vscode/
 .idea/
 
-# Local-only Claude Code support file. Deliberately never committed --
-# see the user's explicit instruction (repo history, if you're reading
-# this from a point before the rewrite that removed it). Any future
-# session: recreate/update it locally as needed, but never `git add` it.
+# Local-only Claude Code support file. Deliberately never committed, and as
+# of 2026-09-30 deliberately not present in this directory at all -- its
+# content lives outside the repo. Kept here as a safety net so that a future
+# session recreating it by habit still can't commit it.
 CLAUDE.md
