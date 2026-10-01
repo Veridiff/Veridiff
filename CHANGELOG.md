@@ -5,6 +5,101 @@ Changelog](https://keepachangelog.com/en/1.1.0/) format. Versioning
 follows [Semantic Versioning](https://semver.org/); pre-1.0, a minor bump
 may include breaking changes, per semver's own pre-1.0 carve-out.
 
+## [0.4.0] - 2026-10-01
+
+### Fixed
+- **Stalker's event queue silently truncated every trace longer than 16384
+  blocks.** Frida's default `queueCapacity` is 16384 *events*, and the queue
+  drops events once full without raising anything, so a long trace came back
+  short and reported success. The traced call runs synchronously on the
+  followed thread, so the queue cannot drain while it runs: the whole trace
+  has to fit. Measured against the new `examples/volume.c` on ARM64 at the
+  default capacity: a 75050-block trace returned 16384 blocks (78% lost), a
+  375250-block trace returned 16384 (96% lost). The ceiling is exactly the
+  capacity, to the event (32768 -> 32768, 65536 -> 65536, 1048576 ->
+  1048576), which is what makes detection reliable rather than a guess.
+  `queueDrainInterval` is irrelevant for the same synchronous-call reason
+  (250 ms, 1 ms and 0 measured identical), so it is deliberately not exposed.
+  Fixed by having the agent set the capacity, defaulting to 2^21 events, and
+  by reporting the capacity and the raw event count back so truncation is
+  visible. *Live-verified on ARM64 and x86-64 in both engines: 1500403 blocks
+  traced in 1.81 s (Python) / 1.30 s (Rust) with no loss and linear scaling,
+  and a deliberately starved capacity correctly flagged as saturated.*
+  Capacity costs nothing until used -- the buffer grows with events actually
+  recorded, measured at ~32 bytes each (150065 events cost 4.8 MB of target
+  RSS whether the capacity was 2^18 or 2^24).
+
+### Added
+- `TraceCallOptions::stalker_queue_capacity` (Rust) /
+  `trace_call(..., stalker_queue_capacity=...)` (Python), plus
+  `DEFAULT_STALKER_QUEUE_CAPACITY` in both.
+- `Trace::event_count` / `Trace::queue_capacity` and the derived
+  `Trace::queue_saturated()` / `Trace.queue_saturated`: true exactly when the
+  event count reached the capacity, i.e. when the trace is truncated. A
+  divergence found in a saturated trace is still real, but "no divergence" is
+  not trustworthy and neither is the tail.
+- **Four new test targets in `examples/`, each proving one claim**, all built
+  for both architectures and run through both engines:
+  - `flattened.c` -- control-flow flattening in the shape OLLVM's `-fla` pass
+    emits (hand-written, not OLLVM output; said plainly because it bounds what
+    the result proves). Closes the oldest honesty gap in the README: the
+    resync heuristic had only ever been tested against synthetic block
+    sequences. Live result on ARM64: three independent conditionals produce
+    exactly three regions, each resyncing at the loop back-edge, with the
+    dispatcher visited nine times in both traces; identical arguments produce
+    none. The x86-64 build of the same source yields six regions because gcc
+    keeps the comparisons as real branches.
+  - `branches.c` -- forces real conditional branches of every form the
+    classifier claims to know. Eight live-verified on ARM64 (`b.ge`, `b.le`,
+    `b.ls`, `b.lt`, `b.ne`, `cbz`, `tbnz`, `tbz`) plus the flattened
+    dispatcher's indirect `br` correctly left unmarked, and five on x86-64
+    (`ja`, `je`, `jg`, `jl`, `jne`). Previously only `jne`/`b.ne` had ever
+    been seen live. `cbnz` is still unproven live -- no build emitted it.
+  - `argtypes.c` -- every `Arg` kind in one call, each contributing a distinct
+    bit to the return value so a wrong result names the broken kind. Returns
+    63 on both architectures. Only the string kind had a committed test
+    before.
+  - `volume.c` -- the million-block claim, and the target the queue bug was
+    found with.
+
+### Changed
+- README restructured as well as updated: Quickstart moved ahead of the
+  deep-dive sections, a contents list added, breaking changes collected in one
+  place, an `examples/` index table added, and the two purely historical bug
+  autopsies compressed to point at this file instead. New sections cover
+  obfuscated control flow (with the branchless-codegen caveat) and scale.
+
+### Investigated
+- **What branchless codegen does to the headline claim.** On the flattened
+  ARM64 target the comparison compiles to `subs` + `csel` -- no branch at all
+  -- so the decision is a *value*, the two paths only fork later at the
+  dispatcher, and the block containing the comparison is one *both* runs
+  executed. Veridiff reports the fork correctly, and the two blocks it names
+  are legible (`add w8, w8, #1` versus `subs w8, w8, #1`), but the
+  `<-- decides here` marker does not fire on a flattened dispatcher, whose
+  terminator is an unconditional indirect `br`. Documented in the README
+  rather than papered over; the top-of-file claim was reworded to match.
+- **Warm-up mode does nothing on Android.** The PLT/GOT lazy-binding confound
+  is glibc behaviour; bionic resolves eagerly. Measured: two identical calls
+  diverge at `strcmp@plt` on x86-64 without warm-up and do not diverge either
+  way on the device. Not a bug, but worth knowing before leaving `warm_up` on
+  there.
+- **A root module running its own `frida-server` hijacks the USB lookup.** On
+  the test device, `get_usb_device()` reached MagiskFrida's server -- which
+  runs under a randomised process name, survives `pkill -f frida-server` and
+  is invisible to `ps` -- and that server refuses to spawn plain executables
+  (`frida.NotSupportedError: only able to spawn apps`). Diagnosed by killing
+  "the" server and watching the host stay connected. Worked around by running
+  our own on an explicit port and addressing it directly; no engine change was
+  needed, since both halves accept any Frida device. Recipe in the README.
+- **An intermittent crash creating several remote devices in one Rust
+  process.** A harness obtaining a fresh `get_remote_device()` per target
+  segfaulted in one run of three; every test passed in isolation and a
+  five-round loop never crashed, so it is reported as a teardown race at that
+  confidence and no higher, with no claim about which layer owns it. Every
+  result from the runs that completed matched the Python engine field for
+  field.
+
 ## [0.3.0] - 2026-10-01
 
 ### Fixed

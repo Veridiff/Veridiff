@@ -70,7 +70,11 @@ fn main() {
     // run A's first call into any externally-linked function (strcmp,
     // here) would show a spurious divergence against run B that has
     // nothing to do with arg_a vs arg_b.
-    let options = TraceCallOptions { warm_up: true };
+    // `..Default::default()` rather than listing every field: that way adding
+    // a future knob to TraceCallOptions doesn't break this call site, and the
+    // default queue capacity (see DEFAULT_STALKER_QUEUE_CAPACITY) is inherited
+    // instead of accidentally zeroed.
+    let options = TraceCallOptions { warm_up: true, ..Default::default() };
     let trace_a = engine
         .trace_call(&mut script, target_address, &[Arg::Str(arg_a.clone())], "int", None, options)
         .expect("trace A failed");

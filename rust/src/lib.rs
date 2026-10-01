@@ -62,7 +62,7 @@ function nativeArgType(spec) {
 }
 
 rpc.exports = {
-    traceCall(targetHex, args, retType, moduleName, warmUp, callId) {
+    traceCall(targetHex, args, retType, moduleName, warmUp, callId, queueCapacity) {
         const target = ptr(targetHex);
         const mod = moduleName
             ? Process.getModuleByName(moduleName)
@@ -160,6 +160,22 @@ rpc.exports = {
         //    every outer frame's unwind blocks, and those blocks then leaked
         //    into the next call (see the callId comment above). Follow on the
         //    outermost entry only, stop on the outermost return only.
+        // Frida's default Stalker.queueCapacity is 16384 EVENTS, and events are
+        // dropped silently once the queue is full -- no error, no flag, just a
+        // short trace. The traced call below runs synchronously on this thread,
+        // so the queue cannot be drained while it runs: the whole trace has to
+        // fit. Measured on a loop executing ~1.5M blocks, the ceiling landed on
+        // exactly the capacity every time (32768 -> 32768 events, 65536 ->
+        // 65536, ...), losing up to 98% of the trace while reporting success.
+        // queueDrainInterval makes no difference for the same reason -- 250ms,
+        // 1ms and 0 all behaved identically -- so it is deliberately not
+        // exposed. Capacity costs nothing until it is used: the buffer grows
+        // with the events actually recorded (~32 bytes each on a 64-bit
+        // target), so a generous capacity is not a generous allocation.
+        if (queueCapacity !== null && queueCapacity !== undefined) {
+            Stalker.queueCapacity = queueCapacity;
+        }
+
         const listener = Interceptor.attach(target, {
             onEnter() {
                 if (this.threadId !== tid) return;
@@ -184,6 +200,10 @@ rpc.exports = {
             send({
                 type: 'done',
                 callId,
+                // Reported so the host can tell a complete trace from one the
+                // event queue truncated: blockCount === queueCapacity means the
+                // queue saturated and blocks were lost.
+                queueCapacity: Stalker.queueCapacity,
                 blockCount,
                 returnValue: retType === 'void' ? null : returnValue.toString(),
             });
@@ -224,6 +244,16 @@ rpc.exports = {
 // --------------------------------------------------------------------------
 // Raw GumEvent decoding.
 // --------------------------------------------------------------------------
+/// Stalker's event queue must hold the WHOLE trace, because the traced call
+/// runs synchronously and the queue cannot drain while it does. Frida's own
+/// default is 16384 events, which silently truncates any longer trace
+/// (measured: a 1.5M-block trace came back with exactly 16384 blocks and no
+/// error). 2^21 events covers the "millions of basic blocks" case this engine
+/// is built for; the buffer grows with events actually recorded (~32 bytes
+/// each on a 64-bit target, measured), so this costs nothing on a short trace.
+/// Raise it for a longer trace, and check `Trace::queue_saturated` either way.
+pub const DEFAULT_STALKER_QUEUE_CAPACITY: usize = 1 << 21;
+
 const GUM_BLOCK: u32 = 1 << 3;
 
 /// Yield `(start, end)` for each GUM_BLOCK record in a raw `onReceive` buffer.
@@ -358,6 +388,28 @@ pub struct Trace {
     pub module_base: u64,
     pub module_size: u64,
     pub return_value: Option<String>,
+    /// Total block events the agent saw, before the module filter -- that
+    /// total, not `blocks.len()`, is what Stalker's queue capped.
+    pub event_count: u64,
+    /// The `Stalker.queueCapacity` in effect for this trace, or 0 if the agent
+    /// did not report one.
+    pub queue_capacity: u64,
+}
+
+impl Trace {
+    /// Whether Stalker's event queue filled up, i.e. this trace is truncated.
+    ///
+    /// The queue drops events silently once full, so a saturated trace looks
+    /// like a short but complete one. The ceiling is exactly the capacity --
+    /// verified against a target executing ~1.5M blocks, where every capacity
+    /// tested produced precisely that many events and no error -- which is
+    /// what makes this check reliable rather than a guess. Re-run with a larger
+    /// `TraceCallOptions::stalker_queue_capacity` if this is true; a divergence
+    /// found in a truncated trace is still real, but "no divergence" is not
+    /// trustworthy, and neither is anything about the end of the trace.
+    pub fn queue_saturated(&self) -> bool {
+        self.queue_capacity > 0 && self.event_count >= self.queue_capacity
+    }
 }
 
 /// Optional, non-default knobs for `trace_call`. `TraceCallOptions::default()`
@@ -366,7 +418,7 @@ pub struct Trace {
 /// what `true` means at the call site, and every future optional knob would
 /// otherwise mean another breaking positional-parameter addition. A struct
 /// absorbs both problems, and costs nothing at the one call site that sets it.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 pub struct TraceCallOptions {
     /// Call the target once, untraced, with the same arguments, immediately
     /// before the traced call. See `trace_call`'s doc comment for why (PLT/
@@ -375,6 +427,17 @@ pub struct TraceCallOptions {
     /// the target executes an extra time before being traced, which isn't
     /// safe for a target with side effects or other non-idempotent state.
     pub warm_up: bool,
+    /// How many block events Stalker may buffer. The traced call runs
+    /// synchronously, so the queue cannot drain while it runs and must hold the
+    /// entire trace; past this, events are dropped silently. Defaults to
+    /// `DEFAULT_STALKER_QUEUE_CAPACITY`, far above Frida's own 16384.
+    pub stalker_queue_capacity: usize,
+}
+
+impl Default for TraceCallOptions {
+    fn default() -> Self {
+        Self { warm_up: false, stalker_queue_capacity: DEFAULT_STALKER_QUEUE_CAPACITY }
+    }
 }
 
 /// Where two traces' control flow first differs.
@@ -474,6 +537,8 @@ enum AgentEvent {
     Done {
         call_id: u64,
         return_value: Option<String>,
+        event_count: u64,
+        queue_capacity: u64,
     },
     Log(String),
 }
@@ -551,6 +616,19 @@ impl ScriptHandler for RelayHandler {
                                     .get("returnValue")
                                     .and_then(Value::as_str)
                                     .map(String::from),
+                                // Absent (0) only from an agent older than this
+                                // crate; queue_saturated() treats 0 as unknown
+                                // rather than claiming truncation on no evidence.
+                                event_count: m
+                                    .payload
+                                    .get("blockCount")
+                                    .and_then(Value::as_u64)
+                                    .unwrap_or(0),
+                                queue_capacity: m
+                                    .payload
+                                    .get("queueCapacity")
+                                    .and_then(Value::as_u64)
+                                    .unwrap_or(0),
                             }
                         }
                     }
@@ -626,7 +704,7 @@ impl TraceBuilder {
         }
     }
 
-    fn into_trace(self, return_value: Option<String>) -> Trace {
+    fn into_trace(self, return_value: Option<String>, event_count: u64, queue_capacity: u64) -> Trace {
         Trace {
             blocks: self.blocks,
             block_ends: self.block_ends,
@@ -634,6 +712,8 @@ impl TraceBuilder {
             module_base: self.module_base,
             module_size: self.module_size,
             return_value,
+            event_count,
+            queue_capacity,
         }
     }
 }
@@ -654,8 +734,10 @@ fn collect_trace(rx: &Receiver<AgentEvent>, call_id: u64) -> Result<Trace, Verid
     let mut builder = TraceBuilder::default();
     loop {
         match rx.recv_timeout(RECV_TIMEOUT) {
-            Ok(AgentEvent::Done { call_id: id, return_value }) if id == call_id => {
-                return Ok(builder.into_trace(return_value))
+            Ok(AgentEvent::Done { call_id: id, return_value, event_count, queue_capacity })
+                if id == call_id =>
+            {
+                return Ok(builder.into_trace(return_value, event_count, queue_capacity))
             }
             Ok(AgentEvent::Log(l)) => eprintln!("[veridiff-agent] {l}"),
             Ok(AgentEvent::Meta { call_id: id, .. }) | Ok(AgentEvent::Chunk { call_id: id, .. })
@@ -733,6 +815,7 @@ impl VeridiffEngine {
             module,
             options.warm_up,
             call_id,
+            options.stalker_queue_capacity,
         ]);
 
         script
@@ -1098,10 +1181,16 @@ mod tests {
     use frida::MessageSend;
 
     fn mk_trace(blocks: Vec<u64>) -> Trace {
+        mk_trace_q(blocks, 1 << 21)
+    }
+
+    /// Same, with an explicit queue capacity, for the saturation tests.
+    fn mk_trace_q(blocks: Vec<u64>, queue_capacity: u64) -> Trace {
         let mut block_ends = HashMap::new();
         for &b in &blocks {
             block_ends.insert(b, b + 4);
         }
+        let event_count = blocks.len() as u64;
         Trace {
             blocks,
             block_ends,
@@ -1109,6 +1198,8 @@ mod tests {
             module_base: 0,
             module_size: 0x10000,
             return_value: None,
+            event_count,
+            queue_capacity,
         }
     }
 
@@ -1425,11 +1516,23 @@ mod tests {
         // flight -- exactly the live-observed ordering.
         tx.send(meta_event(1)).unwrap();
         tx.send(AgentEvent::Chunk { call_id: 1, data: block_chunk(0x400AAA, 0x400AAB) }).unwrap();
-        tx.send(AgentEvent::Done { call_id: 1, return_value: Some("stale".into()) }).unwrap();
+        tx.send(AgentEvent::Done {
+            call_id: 1,
+            return_value: Some("stale".into()),
+            event_count: 1,
+            queue_capacity: 1 << 21,
+        })
+        .unwrap();
         // Call 2 is the one being collected.
         tx.send(meta_event(2)).unwrap();
         tx.send(AgentEvent::Chunk { call_id: 2, data: block_chunk(0x401000, 0x401010) }).unwrap();
-        tx.send(AgentEvent::Done { call_id: 2, return_value: Some("fresh".into()) }).unwrap();
+        tx.send(AgentEvent::Done {
+            call_id: 2,
+            return_value: Some("fresh".into()),
+            event_count: 1,
+            queue_capacity: 1 << 21,
+        })
+        .unwrap();
 
         let trace = collect_trace(&rx, 2).expect("call 2 must complete");
         assert_eq!(trace.blocks, vec![0x1000], "call 1's 0xAAA block must not appear");
@@ -1441,10 +1544,22 @@ mod tests {
     #[test]
     fn collect_trace_does_not_finish_on_a_stale_done() {
         let (tx, rx) = mpsc::channel();
-        tx.send(AgentEvent::Done { call_id: 1, return_value: Some("stale".into()) }).unwrap();
+        tx.send(AgentEvent::Done {
+            call_id: 1,
+            return_value: Some("stale".into()),
+            event_count: 1,
+            queue_capacity: 1 << 21,
+        })
+        .unwrap();
         tx.send(meta_event(2)).unwrap();
         tx.send(AgentEvent::Chunk { call_id: 2, data: block_chunk(0x401000, 0x401010) }).unwrap();
-        tx.send(AgentEvent::Done { call_id: 2, return_value: Some("fresh".into()) }).unwrap();
+        tx.send(AgentEvent::Done {
+            call_id: 2,
+            return_value: Some("fresh".into()),
+            event_count: 1,
+            queue_capacity: 1 << 21,
+        })
+        .unwrap();
 
         let trace = collect_trace(&rx, 2).expect("must keep reading past the stale done");
         assert_eq!(trace.blocks, vec![0x1000]);
@@ -1729,5 +1844,60 @@ mod tests {
             Err(VeridiffError::MalformedResponse(_)) => {}
             other => panic!("expected MalformedResponse, got {other:?}"),
         }
+    }
+
+    // ------------------------------------------------------------------
+    // 0.4.0: Stalker's event queue silently truncated long traces.
+    //
+    // Frida's default queueCapacity is 16384 events and the queue drops events
+    // without complaint once full. The traced call runs synchronously, so the
+    // queue cannot drain while it runs and the whole trace must fit. Measured
+    // on an ARM64 target executing ~1.5M blocks: every capacity tested
+    // returned exactly that many events and reported success, losing up to 98%
+    // of the trace. The ceiling landing exactly on the capacity is what makes
+    // Trace::queue_saturated reliable.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn queue_saturated_is_true_when_the_event_count_reaches_capacity() {
+        let mut t = mk_trace_q(vec![0x10, 0x20], 16384);
+        t.event_count = 16384;
+        assert!(t.queue_saturated());
+    }
+
+    #[test]
+    fn queue_saturated_is_false_for_a_trace_that_fit() {
+        let mut t = mk_trace_q(vec![0x10, 0x20], 16384);
+        t.event_count = 16383;
+        assert!(!t.queue_saturated());
+    }
+
+    /// The queue caps total block events; `blocks` only holds the ones inside
+    /// the target module. Few in-module blocks must not hide a truncated trace.
+    #[test]
+    fn queue_saturated_counts_all_events_not_just_in_module_blocks() {
+        let mut t = mk_trace_q(vec![0x10], 1 << 21);
+        t.event_count = 1 << 21;
+        assert!(t.queue_saturated());
+    }
+
+    /// An agent older than this crate reports no capacity; 0 means "unknown",
+    /// and claiming truncation on no evidence would be worse than saying
+    /// nothing.
+    #[test]
+    fn queue_saturated_is_false_when_capacity_is_unknown() {
+        let mut t = mk_trace_q(vec![0x10], 0);
+        t.event_count = 99999;
+        assert!(!t.queue_saturated());
+    }
+
+    #[test]
+    fn default_options_carry_a_capacity_far_above_fridas_silent_default() {
+        // Frida's own default is 16384. Default::default() must not leave this
+        // at zero either, which a derived Default would have done.
+        let o = TraceCallOptions::default();
+        assert_eq!(o.stalker_queue_capacity, DEFAULT_STALKER_QUEUE_CAPACITY);
+        assert!(o.stalker_queue_capacity >= 1 << 20);
+        assert!(!o.warm_up);
     }
 }

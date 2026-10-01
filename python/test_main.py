@@ -28,7 +28,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 import main as veridiff
 
 
-def mk_trace(blocks):
+def mk_trace(blocks, event_count=None, queue_capacity=1 << 21):
     ends = {b: b + 4 for b in set(blocks)}
     return veridiff.Trace(
         blocks=blocks,
@@ -37,6 +37,8 @@ def mk_trace(blocks):
         module_base=0,
         module_size=0x10000,
         return_value=None,
+        event_count=len(blocks) if event_count is None else event_count,
+        queue_capacity=queue_capacity,
     )
 
 
@@ -467,3 +469,47 @@ def test_well_formed_bytes_field_disagreeing_with_size_is_an_error():
     item = {"address": "0x401146", "mnemonic": "push", "opStr": "rbp", "size": 2, "bytes": "55"}
     with pytest.raises(ValueError):
         veridiff._parse_instruction(item)
+
+
+# --------------------------------------------------------------------------
+# 0.4.0: Stalker's event queue silently truncated long traces.
+#
+# Frida's default queueCapacity is 16384 events and the queue drops events
+# without complaint once full. Because the traced call runs synchronously, the
+# queue cannot drain while it runs, so the whole trace has to fit. Measured on
+# an ARM64 target executing ~1.5M blocks: every capacity tested returned
+# exactly that many events and reported success, losing up to 98% of the
+# trace. The ceiling landing exactly on the capacity is what makes
+# Trace.queue_saturated reliable.
+# --------------------------------------------------------------------------
+
+
+def test_queue_saturated_is_true_when_the_event_count_reaches_capacity():
+    t = mk_trace([0x10, 0x20], event_count=16384, queue_capacity=16384)
+    assert t.queue_saturated
+
+
+def test_queue_saturated_is_false_for_a_trace_that_fit():
+    t = mk_trace([0x10, 0x20], event_count=16383, queue_capacity=16384)
+    assert not t.queue_saturated
+
+
+def test_queue_saturated_counts_all_events_not_just_in_module_blocks():
+    # The queue caps total block events; `blocks` only holds the ones inside
+    # the target module. A trace whose in-module blocks are few can still have
+    # been truncated, so the check has to use the unfiltered count.
+    t = mk_trace([0x10], event_count=1 << 21, queue_capacity=1 << 21)
+    assert t.queue_saturated, "few in-module blocks must not hide a saturated queue"
+
+
+def test_queue_saturated_is_false_when_capacity_is_unknown():
+    # An agent older than this host sends no queueCapacity; 0 means "unknown",
+    # and claiming saturation on no evidence would be worse than saying nothing.
+    t = mk_trace([0x10], event_count=99999, queue_capacity=0)
+    assert not t.queue_saturated
+
+
+def test_default_capacity_is_far_above_fridas_silent_default():
+    # Frida's own default is 16384. The whole point of overriding it is that
+    # the engine advertises million-block traces.
+    assert veridiff.DEFAULT_STALKER_QUEUE_CAPACITY >= 1 << 20

@@ -3,21 +3,39 @@
   the exact instruction where two runs of the same code split
 ════════════════════════════════════════════════════════════════
 
-Two traces go in. One address comes out: the `cmp` / `jcc` (or
-`tst`/`b.cond`, or whatever your architecture calls it) that decided
-your two runs weren't going to end the same way.
+Two traces go in. One address comes out: the exact basic block where your
+two runs stopped agreeing, disassembled, with the branch that split them
+marked — `cmp`/`jne` on x86, `subs`/`b.ne` on ARM64, a jump-table dispatcher
+if the code is flattened. (When a compiler decides a condition without
+branching at all — `csel`, `cmov` — the comparison itself sits in a block
+*both* runs executed, and what you get is the block where the paths actually
+forked. That distinction is demonstrated, not glossed over: see
+**Obfuscated control flow** below.)
 
 That's the whole product. Not a framework. Not a platform. An engine.
 
-**Current release: v0.3.0.** Fixes the worst bug this project has had: a
-**re-entrant (recursive) target** reported a *false divergence between two
-identical calls*, because tracing stopped at the innermost return and the
-outer frames' late events leaked into the next call. Tracing a function
-another thread was calling concurrently hung forever. Both fixed in the
-agent, live-verified on x86, alongside two host-side correctness fixes.
-Breaking: `DivergenceRegion`'s `branch_a`/`branch_b` are now `Option` in
-Rust. Details in **Field notes**; full history in
+**Current release: v0.4.0.** Fixes silent trace truncation: Frida's default
+Stalker queue holds 16384 events and drops the rest **without an error**, so
+every trace longer than that was quietly incomplete — measured at up to 98%
+of blocks lost while reporting success. The engine now sizes the queue itself
+(and lets you size it), and every `Trace` carries `queue_saturated` so
+truncation can never be silent again. Everything in this README is now
+live-verified on **both x86-64 and ARM64/Android**, including control-flow
+flattening and a 1.5-million-block trace. Breaking: `trace_call` gained an
+option field; see **Quickstart**. Full history in
 [`CHANGELOG.md`](CHANGELOG.md).
+
+---
+
+**Contents** — [Quickstart](#quickstart) ·
+[Proof, Not Promises](#proof-not-promises) ·
+[How it works](#how-it-works) ·
+[Warm-up mode](#warm-up-mode) ·
+[Obfuscated control flow](#obfuscated-control-flow) ·
+[Scale](#scale) ·
+[Branch classification](#cross-architecture-branch-classification) ·
+[Field notes](#field-notes-landmines-we-already-stepped-on) ·
+[The Law](#the-law)
 
 ---
 
@@ -50,6 +68,69 @@ Both expose the same four calls (`trace_call`, `disassemble_block`,
 byte-identical results against the same target. Neither one has a
 single line of CLI, GUI, or presentation logic in it. That's not an
 oversight — see **The Law** below.
+
+---
+
+## Quickstart
+
+**Python** — one file, one dependency:
+
+```bash
+pip install frida
+python3 python/main.py <executable> <hex-address-of-target-fn> <arg-a> <arg-b>
+```
+
+**Rust** — a real library, importable by path/git from any other crate:
+
+```toml
+# your Cargo.toml
+[dependencies]
+veridiff = { path = "../Veridiff/rust" }
+```
+
+```rust
+let options = TraceCallOptions { warm_up: true };
+let trace = engine.trace_call(&mut script, addr, &args, "int", None, options)?;
+let d = VeridiffEngine::find_first_divergence(&trace_a, &trace_b);
+```
+
+`src/main.rs` in this repo is nothing but a thin CLI wrapper over that
+same API — read it as a usage example, not as the product.
+
+New in v0.2.0, both languages: `trace_call(..., warm_up=True)` / a
+`TraceCallOptions { warm_up: true }` argument (see **Warm-up mode**), and
+`instruction.is_conditional_branch` / `insn.is_conditional_branch()` on
+every `Instruction` returned by `disassemble_block` (see **Cross-architecture
+branch classification**). Both are additive on the Python side; the Rust
+`trace_call` signature gained a required trailing parameter, which is a
+breaking change for existing callers on this pre-1.0 crate -- pass
+`TraceCallOptions::default()` for the old behavior.
+
+### Breaking changes you may have to touch
+
+Pre-1.0, so these come as minor bumps. Both are small.
+
+**v0.4.0** added `stalker_queue_capacity` to `TraceCallOptions`, which breaks
+Rust struct-literal construction. Use `..Default::default()` and future knobs
+won't break you either:
+
+```rust
+let options = TraceCallOptions { warm_up: true, ..Default::default() };
+```
+
+`Trace` also gained `event_count` and `queue_capacity`, and with them
+`queue_saturated()` / `.queue_saturated` — **check it on any trace long
+enough to matter**, because a saturated trace is silently truncated (see
+**Field notes**). Python's `trace_call` takes the capacity as a keyword
+argument, so nothing there breaks.
+
+**v0.3.0** made `DivergenceRegion`'s `branch_a`/`branch_b` `Option<u64>` in
+Rust (`Optional[int]` in Python), so "one trace ran out while the other kept
+going" can be reported instead of silently dropped.
+
+The agent and host also exchange a per-call id and a queue capacity, so a host
+and an `AGENT_SOURCE` from different versions must not be mixed. Within a
+release they always match, since each engine embeds its own copy.
 
 ---
 
@@ -165,13 +246,35 @@ untouched; only the compiler target changed. Full walkthrough, including
 why this needs `spawn()` (not `attach()` to a system-library hook) and
 what didn't work first, is in **Field notes** below.
 
-One disclosure about this particular capture: it was produced by v0.2.3's
-agent, and no ARM64 device was connected when v0.3.0's agent changes were
-made. Those changes key off thread ids and call depth, with no
-instruction-level assumptions, and the x86 half of this proof reproduces
-byte-for-byte on v0.3.0 — but `check_license` is neither recursive nor
-called from a second thread, so "v0.3.0 would print the same thing here"
-is reasoning from the x86 result, not a measurement on the phone.
+This capture is re-run on real hardware every release that touches the agent.
+The numbers above are v0.4.0's, taken on a POCO F7 Ultra running Android 16,
+and they are identical to the ones v0.2.3 first produced — same block counts,
+same divergence index, same deciding instruction — with both engines agreeing
+on every field. The Android walkthrough below is not a one-off demo either:
+six separate targets covering recursion, concurrency, flattened control flow,
+every argument kind, the full set of ARM64 conditional-branch forms, and a
+1.5-million-block trace all run against this device, and all of them are in
+[`examples/`](examples/) so you can repeat them.
+
+### What's in `examples/`
+
+Seven small C files, one claim each, rather than one big binary that proves
+nothing in particular. Every one is built for both x86-64 and ARM64, run
+through both engines, and carries its exact build flags and resulting symbol
+address in its own header comment.
+
+| File | What it is there to prove |
+|---|---|
+| [`licensecheck.c`](examples/licensecheck.c) | The baseline proof above: find the byte comparison that split two runs. |
+| [`depth.c`](examples/depth.c) | A recursive target traces completely and two identical calls do not diverge (the v0.3.0 bug). |
+| [`mt.c`](examples/mt.c) | A second thread calling the traced function concurrently neither hangs the trace nor corrupts it. |
+| [`flattened.c`](examples/flattened.c) | OLLVM-shaped control-flow flattening: the resync heuristic on real obfuscated code, and what branchless codegen does to the answer. |
+| [`branches.c`](examples/branches.c) | `is_conditional_branch` against real compiled branches of every form, not hand-written mnemonics. |
+| [`argtypes.c`](examples/argtypes.c) | Every argument kind (`int`, `uint`, `int64`, `uint64`, `pointer`, `string`) arrives intact. |
+| [`volume.c`](examples/volume.c) | The million-block claim, and that a truncated trace is detectable. |
+
+`mt.c` deliberately contains a copy of `licensecheck.c`'s function, so the
+concurrency test varies the thread and nothing else.
 
 ---
 
@@ -283,26 +386,94 @@ opt in.
 
 ---
 
-## Resync tuning (OLLVM heuristics)
+## Obfuscated control flow
 
-`find_divergence_regions`' old rule was "the first address both traces
-share, within the lookahead window, is where they resynced." That's wrong
-for exactly the code this tool exists to analyze: OLLVM-flattened control
-flow routes many logically-different paths through the *same* dispatcher
-block, so that address shows up in both windows almost immediately after
-nearly any divergence -- without the two paths having actually merged back
-into the same control flow. The old rule would call that a resync. It isn't
-one; it's two different paths both passing through shared machinery on
-their way to somewhere else.
+This is the case the whole resync machinery exists for, and through v0.3.0 it
+was the weakest-tested thing in the project: the heuristic was only ever
+checked against hand-written block sequences, because no flattened binary was
+on hand. [`examples/flattened.c`](examples/flattened.c) fixes that. It is
+control-flow flattening written by hand in the shape OLLVM's `-fla` pass
+emits — every original basic block becomes a case of one switch, and a single
+dispatcher is re-entered between every pair of them — with an opaque predicate
+guarding a block that never runs. It is not output from OLLVM itself, which is
+stated plainly because it matters for how much the result proves; the
+structural property Veridiff has to cope with is identical either way.
 
-v0.2.0 requires a candidate to *hold up*: at least three consecutive blocks
-must keep agreeing right after the candidate address before it's accepted
-as a real merge. A dispatcher fly-by is followed by state-dependent blocks
-that differ between the two traces almost every time; a genuine merge keeps
-agreeing. Synthetic proof (no live OLLVM-obfuscated binary was available to
-test this against, so this is exactly what it looks like -- a targeted
-unit test, not a live capture; see `dispatcher_style_coincidental_match_is_rejected`
-and its paired acceptance test in both test suites):
+`find_divergence_regions`' old rule was "the first address both traces share,
+within the lookahead window, is where they resynced." Flattening breaks that
+rule completely: the dispatcher shows up in both windows almost immediately
+after *any* divergence, without the paths having merged. Since v0.2.0 a
+candidate has to *hold up* — at least three consecutive blocks must keep
+agreeing after it. Here is what that produces on the real thing, traced on
+the phone, three independent conditionals in the source:
+
+```
+trace GOOD ('VALID-KEY-123',1): 37 blocks, returned 7
+trace BAD  ('WRONG-KEY',0):     37 blocks, returned -7
+GOOD most-repeated blocks: [('0x7b8', 9), ('0x7d0', 9), ('0x93c', 8)]
+BAD  most-repeated blocks: [('0x7b8', 9), ('0x7d0', 9), ('0x93c', 8)]
+
+region 0: last_common=0x7d0 branch_a=0x81c branch_b=0x834 resync_block=0x93c
+region 1: last_common=0x7d0 branch_a=0x86c branch_b=0x884 resync_block=0x93c
+region 2: last_common=0x7d0 branch_a=0x8b8 branch_b=0x8d0 resync_block=0x93c
+```
+
+Three regions for three conditionals, each one resyncing at the loop
+back-edge, with the dispatcher at `0x7d0` visited nine times in both traces —
+that repetition is the flattening, and it is exactly what a naive first-match
+rule would have tripped over. Change only the third condition and you get one
+region; pass identical arguments and you get none at all. Both engines
+produce these numbers identically.
+
+### What branchless code does to the answer
+
+Now the part a tool like this has to be honest about. The last common block
+is the dispatcher, so disassembling it does **not** show you a comparison:
+
+```
+0x7d0  ldr x11, [sp, #8]          <- load the state variable
+0x7d4  nop
+0x7d8  adr x10, #0x...528         <- jump table
+0x7dc  adr x8, #0x...7dc
+0x7e0  ldrsw x9, [x10, x11, lsl #2]
+0x7e4  add x8, x8, x9
+0x7e8  br x8                      <- unconditional, correctly NOT marked
+```
+
+The real comparison ran two blocks earlier, in a block **both** runs
+executed, and it never branched at all:
+
+```
+0x7fc  ldr x8, [sp, #0x20]
+0x800  ldrb w10, [x8]             <- key[0]
+0x804  mov w9, #3                 <- state 3 (score -= 1)
+0x808  mov w8, #2                 <- state 2 (score += 1)
+0x80c  subs w10, w10, #0x56       <- compare with 'V'
+0x810  csel w8, w8, w9, eq        <- branchless: picks the state as DATA
+0x814  str w8, [sp, #0x18]
+0x818  b #0x...93c                <- back to the dispatcher
+```
+
+So on this target the decision is a value, not a branch, and control flow
+forks later, at the dispatcher. Veridiff reports that fork precisely — which
+is its actual promise — and the two blocks it hands you are immediately
+legible: run A went to `add w8, w8, #1`, run B to `subs w8, w8, #1`, which is
+`score += 1` versus `score -= 1` in the source. The `<-- decides here` marker,
+however, does not fire on a flattened dispatcher, and chasing the comparison
+means walking back through the shared prefix the engine already gave you
+(about twenty lines against the public API).
+
+This is not theoretical, and it is not an ARM64 quirk either — it is a
+codegen question. The same `examples/flattened.c` built for x86-64 with `gcc
+-O0` keeps the comparison as a real branch, so there the deciding block does
+end in `cmp al, 0x56` / `jne` with the marker on it, and the branchier code
+yields six regions instead of three. Same source, same engine, two different
+shapes of answer. Know which one you are looking at.
+
+The synthetic unit tests that came first are still in both suites
+(`dispatcher_style_coincidental_match_is_rejected` and its paired acceptance
+test), because they pin the exact boundary the live target only exercises
+incidentally:
 
 ```
 # same shared block (0xD0) in both cases -- only the outcome differs
@@ -314,6 +485,47 @@ a = [0x10, 0x20, 0x30, 0xD0, 0xAA, 0xAB, 0xAC]
 b = [0x10, 0x20, 0x31, 0xD0, 0xAA, 0xAB, 0xAC]   # genuinely continues identically
   -> resync_block: Some(0xD0)                       # correctly accepted
 ```
+
+---
+
+## Scale
+
+The claim at the top of this file is "millions of basic blocks in, one address
+out." Until v0.4.0 that was never measured, and when it finally was, it turned
+out to be false for a reason that had nothing to do with the diff: Frida's
+Stalker queue defaults to 16384 events and **drops the rest silently**, so
+every long trace came back short and successful. See **Field notes** for the
+measurements. With the queue sized properly — which the engine now does by
+default — here is [`examples/volume.c`](examples/volume.c) on the phone:
+
+```
+    iters     blocks     events   capacity   saturated      s      blocks/s
+     1000       7505       7527    2097152       False   0.03       267529
+    10000      75023      75045    2097152       False   0.14       546701
+    50000     375103     375125    2097152       False   0.49       762960
+   200000    1500403    1500425    2097152       False   1.81       829526
+```
+
+1.5 million basic blocks off a phone over USB in under two seconds, scaling
+linearly, with no events lost. Diffing two traces of that size costs
+milliseconds, because the diff is a prefix scan rather than an edit-distance
+algorithm:
+
+```
+750203 vs 750213 blocks
+find_first_divergence:   25.7 ms -> index 750202
+find_divergence_regions: 61.2 ms -> 1 region
+```
+
+And when the queue *is* too small, that is now visible rather than silent:
+
+```
+capacity=16384 -> events=16384  blocks=16364  saturated=True
+```
+
+The Rust engine produces the same numbers (1.30 s for the 1.5M-block trace
+against Python's 1.81 s, which is the only number in this README where the two
+engines differ by design rather than by accident).
 
 ---
 
@@ -335,64 +547,44 @@ same block reports the exact same groups. Nothing in `.groups`
 distinguishes them. Mnemonic text is the only signal that does, on any
 architecture, which is what `is_conditional_branch` actually checks.
 
-Both halves are now live-verified. The x86 half was from the start (see
-above); the ARM64 half (`cbz`/`cbnz`/`tbz`/`tbnz`/`b.eq`/`b.ne`/...) was
-mock-tested only through v0.2.2, closed in v0.2.3 by the real ARM64 trace
-in **Proof, Not Promises** above -- `b.ne` correctly flagged as the
-deciding instruction against real Bionic code on a real device, not a
-synthetic payload. Getting there took two attempts and surfaced real
-Frida/Android landmines along the way; see **Field notes** for the full
-account, since a tool built for reverse engineers should show its own
-work. The underlying disassembly mechanism is still Frida's own
-well-established multi-arch Capstone integration, unmodified by this
-change -- what changed is evidence, not the mechanism.
+Through v0.3.0 the live evidence behind that claim was one instruction:
+`jne` on x86 and `b.ne` on ARM64. Everything else was a unit test feeding
+the classifier strings, which proves the string matching and nothing about
+what compilers actually emit. [`examples/branches.c`](examples/branches.c)
+closes that: a function shaped to force real branches of every kind — a null
+test, single-bit tests, signed and unsigned compares, and a switch. Every
+arm calls a `noinline` helper, because an earlier version of that file
+without the calls compiled on ARM64 at `-O1` into one `cbz` and a wall of
+branchless `csel`, which is its own lesson about this architecture.
 
----
+Traced on the device, then disassembled and checked instruction by
+instruction against what ARM64 actually calls conditional:
 
-## Quickstart
-
-**Python** — one file, one dependency:
-
-```bash
-pip install frida
-python3 python/main.py <executable> <hex-address-of-target-fn> <arg-a> <arg-b>
+```
+b      x2   engine=[False] expected=False  OK
+b.ge   x1   engine=[True]  expected=True   OK
+b.le   x1   engine=[True]  expected=True   OK
+b.ls   x1   engine=[True]  expected=True   OK
+b.lt   x1   engine=[True]  expected=True   OK
+b.ne   x1   engine=[True]  expected=True   OK
+bl     x8   engine=[False] expected=False  OK
+cbz    x1   engine=[True]  expected=True   OK
+ret    x2   engine=[False] expected=False  OK
+tbnz   x1   engine=[True]  expected=True   OK
+tbz    x2   engine=[True]  expected=True   OK
 ```
 
-**Rust** — a real library, importable by path/git from any other crate:
+Eight conditional forms live-verified on ARM64 — `b.ge`, `b.le`, `b.ls`,
+`b.lt`, `b.ne`, `cbz`, `tbnz`, `tbz` — plus the indirect `br` from the
+flattened dispatcher above, correctly left unmarked. On x86-64 the same
+target gives `ja`, `je`, `jg`, `jl`, `jne` flagged and `jmp`, `call`, `ret`
+not. **`cbnz` is the one form still unproven live:** no build produced it
+(clang preferred `cbz` with inverted logic), so it remains covered by unit
+test only. Said rather than quietly counted as verified.
 
-```toml
-# your Cargo.toml
-[dependencies]
-veridiff = { path = "../Veridiff/rust" }
-```
-
-```rust
-let options = TraceCallOptions { warm_up: true };
-let trace = engine.trace_call(&mut script, addr, &args, "int", None, options)?;
-let d = VeridiffEngine::find_first_divergence(&trace_a, &trace_b);
-```
-
-`src/main.rs` in this repo is nothing but a thin CLI wrapper over that
-same API — read it as a usage example, not as the product.
-
-New in v0.2.0, both languages: `trace_call(..., warm_up=True)` / a
-`TraceCallOptions { warm_up: true }` argument (see **Warm-up mode**), and
-`instruction.is_conditional_branch` / `insn.is_conditional_branch()` on
-every `Instruction` returned by `disassemble_block` (see **Cross-architecture
-branch classification**). Both are additive on the Python side; the Rust
-`trace_call` signature gained a required trailing parameter, which is a
-breaking change for existing callers on this pre-1.0 crate -- pass
-`TraceCallOptions::default()` for the old behavior.
-
-New in v0.3.0: `DivergenceRegion`'s `branch_a`/`branch_b` are now
-`Option<u64>` in Rust (`Optional[int]` in Python, where nothing enforced the
-old annotation anyway), so the case "one trace ran out while the other kept
-going" can be reported instead of silently dropped. That's a breaking change
-for Rust callers reading those fields -- they were plain `u64` through
-v0.2.4. Everything else in v0.3.0 is a behavior fix behind unchanged
-signatures: the same calls simply stop lying about re-entrant targets. Note
-that the agent and host now exchange a per-call id, so a host and an
-`AGENT_SOURCE` from different versions must not be mixed.
+The underlying disassembly is still Frida's own multi-arch Capstone
+integration, unmodified by any of this — what changed is evidence, not
+mechanism.
 
 ---
 
@@ -403,6 +595,63 @@ buried. These cost real debugging time to find; they're documented
 inline in both agents, and repeated here because they're the kind of
 thing you only learn by actually tracing a real process instead of
 trusting synthetic test data.
+
+- **Frida's Stalker drops events once its queue is full, silently, and the
+  default queue holds 16384 of them.** This was the worst thing in the
+  project when v0.4.0 went looking for it, because the failure mode is a
+  trace that is short, wrong, and reports success. The traced call runs
+  synchronously on the thread being followed, so the queue cannot drain while
+  it runs: the *whole* trace has to fit. Measured against
+  [`examples/volume.c`](examples/volume.c) on ARM64, at a default capacity:
+
+  ```
+   iters   capacity   events   expected
+   10000      16384    16384      75050   -> 78% of the trace lost
+   50000      16384    16384     375250   -> 96% lost
+  ```
+
+  The ceiling is exactly the capacity, to the event — 32768 gives 32768,
+  65536 gives 65536 — which is what makes the fix detectable rather than a
+  guess. `Stalker.queueDrainInterval` makes no difference at all (250 ms, 1 ms
+  and 0 behaved identically) for the same synchronous-call reason, so the
+  engine deliberately does not expose it. What it does expose is the capacity
+  (`stalker_queue_capacity`, defaulting to 2²¹ events rather than Frida's
+  16384) and `Trace.queue_saturated`, which is true exactly when the event
+  count reached the capacity. **If that flag is true, a divergence you found
+  is still real, but "no divergence" means nothing and neither does anything
+  near the end of the trace.** Capacity is close to free until it is used: the
+  buffer grows with events actually recorded, measured at ~32 bytes each on a
+  64-bit target (150065 events cost 4.8 MB of target RSS, and the same trace
+  cost the same 4.8 MB whether the capacity was 2¹⁸ or 2²⁴).
+
+- **A root module running its own `frida-server` will quietly answer instead
+  of yours, and may refuse to spawn anything.** On the Android device used
+  here, `frida.get_usb_device()` connected fine and enumerated 363 processes,
+  then `spawn()` of a plain executable failed with
+  `frida.NotSupportedError: only able to spawn apps`. The server answering was
+  not the one started moments earlier: MagiskFrida runs `frida-server` under a
+  randomised process name, so it survives `pkill -f frida-server`, is invisible
+  to `ps | grep frida`, and wins the USB lookup. Killing "the" server and
+  watching the host stay connected is how that gets diagnosed. The fix is to
+  stop guessing which server you are talking to: start your own on an explicit
+  port and address it directly.
+
+  ```bash
+  adb forward tcp:27500 tcp:27500
+  adb shell 'su -c "nohup /data/local/tmp/frida-server -l 0.0.0.0:27500 &"'
+  # host side: add_remote_device("127.0.0.1:27500") / get_remote_device(...)
+  ```
+
+  Nothing in the engine needed to change for this — both halves take whatever
+  Frida device you hand them — but it cost real time to work out, and it will
+  bite anyone testing on a daily-driver phone with root tooling installed.
+
+- **Warm-up mode does nothing on Android, and that is correct.** The PLT/GOT
+  lazy-binding confound that **Warm-up mode** above documents is a glibc
+  behaviour. Measured on the device: two identical calls diverge at
+  `strcmp@plt` on x86-64 without warm-up, and on Android they do not diverge
+  either way, because bionic resolves these eagerly rather than on first call.
+  Leaving `warm_up` on costs an extra untraced call and buys nothing there.
 
 - **`Stalker.follow()` silently does nothing if you call it from a
   plain `rpc.exports` handler and then invoke a `NativeFunction`
@@ -455,52 +704,40 @@ trusting synthetic test data.
   last line in both, purely so the spawned process doesn't get left
   stopped. If you're extending either demo, keep it that way.
 
-- **`resync_confirmed` compared a candidate resync point against *itself*,
-  not against what came after it.** `a[p..p+len]` vs `b[bj..bj+len]` starts
-  AT the candidate — and `bj` is only ever found because `b[bj] == a[p]` already
-  holds, so that leading element is a trivial self-match by construction.
-  Whenever either trace happened to end exactly at the candidate, `len`
-  collapsed to 1 and the "confirmation" checked nothing but that
-  tautology — a resync could be accepted with zero real evidence, in
-  precisely the single-block-fly-by case `MIN_CONFIRM` exists to reject
-  (see **Resync tuning** above). Concretely, `a=[...,0x30,0xD0]` (ends at
-  the shared dispatcher) against `b=[...,0x31,0xD0,0xBB,0xBC,0xBD]`
-  (three further, never-examined, genuinely different blocks) used to
-  confirm `0xD0` as a real merge. Fixed semantics: both traces ending
-  together at the candidate is legitimate and still confirms (nothing
-  left in either to disagree with — exhaustive evidence, not absent
-  evidence); one trace ending while the other continues is the bug above
-  and is now rejected. Found by a later review, not by the
-  test suite that existed at the time — the tests that would have caught
-  it exist now. This held the title of most serious bug in the project's
-  history through v0.2.4; the re-entrancy bug below, found in v0.3.0, is
-  worse, because it broke `find_first_divergence` itself rather than the
-  resync heuristic layered above it.
+- **Creating several remote devices in sequence inside one Rust process
+  crashed it, intermittently.** Seen while running the ARM64 parity checks:
+  a harness that obtained a fresh `get_remote_device()` per test, spawned,
+  attached, traced, and dropped everything, segfaulted partway through one run
+  in three. Every individual test passed in isolation, and a loop doing
+  device + spawn + attach + handler + trace five times over never crashed, so
+  this is a race in teardown rather than something reproducible on demand —
+  reported at that confidence and no higher, with no claim about which layer
+  owns it. The engine is not implicated: every result it produced in the runs
+  that completed matched the Python engine field for field. If you drive this
+  from Rust over a remote device, obtain the device once and reuse it rather
+  than rebuilding the connection per target.
 
-  **That fix was itself incomplete, and v0.3.0 finishes it.** It
-  special-cased only *zero* blocks remaining after the candidate, while the
-  general `min(MIN_CONFIRM, a_remaining, b_remaining)` window still shrank
-  below `MIN_CONFIRM` whenever either trace had one or two blocks left — so
-  `a=[…,0x30,0xD0,0xAA]` against `b=[…,0x31,0xD0,0xAA,0xBB,0xBC,0xBD]`
-  confirmed `0xD0` on a *single* matching block while B's three remaining,
-  genuinely different blocks went unexamined. The same shape as the original
-  bug, one block further along, and found the same way: by re-reading the
-  fix against the docstring that describes what it was supposed to
-  guarantee. The rule now states the intent directly instead of enumerating
-  cases — a confirmation window shorter than `MIN_CONFIRM` is acceptable
-  only when it is short *because both traces ran out together*, and then
-  every remaining block must match.
+- **`resync_confirmed` confirmed a resync against *itself*, twice over.**
+  Condensed, because `CHANGELOG.md` has the full autopsy and the tests now
+  pin both halves: the comparison window started *at* the candidate, whose
+  first element matches by construction, so a resync could be accepted on
+  zero evidence (v0.2.1). The fix special-cased only "zero blocks left",
+  while the window still silently shrank below `MIN_CONFIRM` whenever either
+  trace had one or two blocks left — the same bug one block further along
+  (v0.4.0's predecessor, v0.3.0). Both were found by re-reading the code
+  against the docstring stating what it was supposed to guarantee, not by any
+  test. The rule now states intent rather than enumerating cases: a short
+  confirmation window is acceptable only when it is short *because both traces
+  ran out together*, and then every remaining block must match. Worth
+  repeating as a general lesson — a fix that enumerates the cases you thought
+  of will miss the one you didn't.
 
-- **Warm-up mode's untraced pre-call shared the same allocated argument
-  buffer as the traced call that followed it.** For a `'string'`
-  argument, both calls pointed at one `Memory.allocUtf8String` buffer —
-  a target that decodes or transforms its argument in place (routine for
-  the obfuscated checks this tool exists to analyze) would have the
-  untraced warm-up call mutate the buffer the traced call then reads,
-  silently tracing over already-mutated input instead of your actual
-  argument. Fixed by giving the warm-up call its own allocation. Not
-  live-verified against a self-mutating target specifically — none was
-  built to test it.
+- **Warm-up mode's untraced pre-call used to share one argument buffer with
+  the traced call.** For a `'string'` argument that meant a target which
+  decodes its argument in place — routine in obfuscated checks — would have
+  the warm-up call mutate the buffer the traced call then read. Fixed in
+  v0.2.1 by giving the warm-up call its own allocation; still not
+  live-verified against a self-mutating target, since none was built.
 
 - **Tracing a re-entrant (recursive) target used to produce a false
   divergence between two *identical* calls.** Two mechanisms, one root
@@ -602,10 +839,14 @@ trusting synthetic test data.
   The full recipe, so you don't have to rediscover it:
 
   ```bash
-  # device side: frida-server's version must line up with your host frida
+  # device side: frida-server's version must line up with your host frida.
+  # Bind it to an explicit port and address it directly -- a root module may
+  # be running its own frida-server that would otherwise answer instead
+  # (see the field note above).
   adb push frida-server-<ver>-android-arm64 /data/local/tmp/frida-server
   adb shell chmod 755 /data/local/tmp/frida-server
-  adb shell "su -c '/data/local/tmp/frida-server -D &'"
+  adb forward tcp:27500 tcp:27500
+  adb shell 'su -c "nohup /data/local/tmp/frida-server -l 0.0.0.0:27500 &"'
 
   # host side: build the SAME examples/licensecheck.c, dynamically linked
   $ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android26-clang \
@@ -615,10 +856,12 @@ trusting synthetic test data.
   llvm-nm licensecheck-arm64 | grep check_license   # the offset, e.g. 0x798
   ```
 
-  Then `frida.get_usb_device()` (Python) / `DeviceType::USB` (Rust),
-  `spawn()` the pushed binary, and resolve the module's runtime base once
-  before computing `base + offset` — Android requires PIE, so the load
-  address differs every run, exactly like any other ASLR target.
+  Then `add_remote_device("127.0.0.1:27500")` (Python) /
+  `get_remote_device(...)` (Rust), `spawn()` the pushed binary, and resolve the
+  module's runtime base once before computing `base + offset` — Android
+  requires PIE, so the load address differs every run, exactly like any other
+  ASLR target. All six targets in [`examples/`](examples/) are driven exactly
+  this way.
 
 ---
 
@@ -644,9 +887,10 @@ exception:
   process and proving the fix against real output.
 - New architecture support — ARM32/Thumb, MIPS, RISC-V, wherever
   Frida and Capstone already reach and our own classification logic
-  (branch-type detection, and whatever comes after it) doesn't yet. x86
-  and ARM64 are both live-verified as of v0.2.3 (see **Proof, Not
-  Promises**); ARM32/Thumb, MIPS, and RISC-V remain untried.
+  (branch-type detection, and whatever comes after it) doesn't yet. x86-64
+  and ARM64 are both live-verified across the whole feature set as of v0.4.0
+  (see **Proof, Not Promises**); ARM32/Thumb, MIPS, and RISC-V remain
+  untried.
 - Portability fixes for platforms the current code handles badly.
 
 **We will not merge, ever, under any framing:**

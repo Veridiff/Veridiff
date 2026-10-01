@@ -32,7 +32,7 @@ import sys
 from dataclasses import dataclass
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple, Union
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 try:
     import frida  # type: ignore
@@ -76,7 +76,7 @@ function nativeArgType(spec) {
 }
 
 rpc.exports = {
-    traceCall(targetHex, args, retType, moduleName, warmUp, callId) {
+    traceCall(targetHex, args, retType, moduleName, warmUp, callId, queueCapacity) {
         const target = ptr(targetHex);
         const mod = moduleName
             ? Process.getModuleByName(moduleName)
@@ -174,6 +174,22 @@ rpc.exports = {
         //    every outer frame's unwind blocks, and those blocks then leaked
         //    into the next call (see the callId comment above). Follow on the
         //    outermost entry only, stop on the outermost return only.
+        // Frida's default Stalker.queueCapacity is 16384 EVENTS, and events are
+        // dropped silently once the queue is full -- no error, no flag, just a
+        // short trace. The traced call below runs synchronously on this thread,
+        // so the queue cannot be drained while it runs: the whole trace has to
+        // fit. Measured on a loop executing ~1.5M blocks, the ceiling landed on
+        // exactly the capacity every time (32768 -> 32768 events, 65536 ->
+        // 65536, ...), losing up to 98% of the trace while reporting success.
+        // queueDrainInterval makes no difference for the same reason -- 250ms,
+        // 1ms and 0 all behaved identically -- so it is deliberately not
+        // exposed. Capacity costs nothing until it is used: the buffer grows
+        // with the events actually recorded (~32 bytes each on a 64-bit
+        // target), so a generous capacity is not a generous allocation.
+        if (queueCapacity !== null && queueCapacity !== undefined) {
+            Stalker.queueCapacity = queueCapacity;
+        }
+
         const listener = Interceptor.attach(target, {
             onEnter() {
                 if (this.threadId !== tid) return;
@@ -198,6 +214,10 @@ rpc.exports = {
             send({
                 type: 'done',
                 callId,
+                // Reported so the host can tell a complete trace from one the
+                // event queue truncated: blockCount === queueCapacity means the
+                // queue saturated and blocks were lost.
+                queueCapacity: Stalker.queueCapacity,
                 blockCount,
                 returnValue: retType === 'void' ? null : returnValue.toString(),
             });
@@ -239,6 +259,17 @@ rpc.exports = {
 # --------------------------------------------------------------------------
 # Raw GumEvent decoding.
 # --------------------------------------------------------------------------
+# Stalker's event queue must hold the WHOLE trace, because the traced call
+# runs synchronously and the queue cannot drain while it does. Frida's own
+# default is 16384 events, which silently truncates any trace longer than that
+# (measured: a 1.5M-block trace came back with exactly 16384 blocks and no
+# error). 2**21 events covers the "millions of basic blocks" case this engine
+# is built for; the buffer grows with events actually recorded (~32 bytes each
+# on a 64-bit target, measured), so this costs nothing on a short trace.
+# Raise it for a trace longer than this, and check `Trace.queue_saturated`
+# either way.
+DEFAULT_STALKER_QUEUE_CAPACITY = 1 << 21
+
 _GUM_BLOCK = 1 << 3
 _TAG_STRUCT = struct.Struct("<I")
 
@@ -399,6 +430,23 @@ class Trace:
     module_base: int
     module_size: int
     return_value: Optional[str]
+    event_count: int
+    queue_capacity: int
+
+    @property
+    def queue_saturated(self) -> bool:
+        """Whether Stalker's event queue filled up, i.e. this trace is truncated.
+
+        The queue drops events silently once full, so a saturated trace looks
+        like a short but complete one. The ceiling is exactly the capacity --
+        verified against a target executing ~1.5M blocks, where every capacity
+        tested produced precisely that many events and no error -- which is
+        what makes this check reliable rather than a guess. Re-run with a larger
+        `stalker_queue_capacity` if this is True; any divergence found in a
+        truncated trace is still real, but "no divergence" is not trustworthy,
+        and neither is anything about the end of the trace.
+        """
+        return self.queue_capacity > 0 and self.event_count >= self.queue_capacity
 
 
 @dataclass(frozen=True)
@@ -542,6 +590,7 @@ class VeridiffEngine:
         ret_type: str = "void",
         module: Optional[str] = None,
         warm_up: bool = False,
+        stalker_queue_capacity: int = DEFAULT_STALKER_QUEUE_CAPACITY,
     ) -> Trace:
         """Call `address` once with `args` and return its execution trace.
 
@@ -557,6 +606,12 @@ class VeridiffEngine:
         Off by default: it means the target executes an extra time before
         being traced, which isn't safe for a target with side effects or
         other non-idempotent state.
+
+        `stalker_queue_capacity` is how many block events Stalker may buffer.
+        The traced call runs synchronously, so the queue cannot drain while it
+        runs and must hold the entire trace; past it, events are dropped
+        silently. See `DEFAULT_STALKER_QUEUE_CAPACITY` and
+        `Trace.queue_saturated`.
         """
         if self._script is None:
             raise RuntimeError("call spawn() or attach() before trace_call()")
@@ -572,7 +627,8 @@ class VeridiffEngine:
         # statements) -- so every chunk/meta/done message is guaranteed to
         # have already reached _on_message by the time this call returns.
         self._script.exports_sync.trace_call(
-            hex(address), payload_args, ret_type, module, warm_up, self._call_id
+            hex(address), payload_args, ret_type, module, warm_up, self._call_id,
+            stalker_queue_capacity,
         )
 
         if not self._meta:
@@ -599,6 +655,10 @@ class VeridiffEngine:
             module_base=module_base,
             module_size=module_size,
             return_value=self._done.get("returnValue"),
+            # Total block events the agent saw, before the module filter below
+            # -- that total, not the filtered count, is what the queue capped.
+            event_count=int(self._done.get("blockCount", 0)),
+            queue_capacity=int(self._done.get("queueCapacity", 0)),
         )
 
     def disassemble_block(self, trace: Trace, relative_start: int) -> List[Instruction]:
